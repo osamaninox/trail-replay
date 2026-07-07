@@ -1,0 +1,43 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - HTTP_ADDR=:8080
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=trailuser
+      - DB_PASSWORD=trailpass
+      - DB_NAME=traildb
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - trail-network
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_USER=trailuser
+      - POSTGRES_PASSWORD=trailpass
+      - POSTGRES_DB=traildb
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trailuser -d traildb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trail-network
+
+volumes:
+  postgres_data:
+
+networks:
+  trail-network:
+    driver: bridge
