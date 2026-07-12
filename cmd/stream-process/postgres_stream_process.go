@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -37,12 +39,24 @@ type transactionState struct {
 	changes   []postgres.WalChangeEntity
 }
 
+type walPersister interface {
+	LoadCheckpoint(slotName string) (pglogrepl.LSN, error)
+	SaveCheckpoint(slotName string, lsn pglogrepl.LSN) error
+	PersistTransaction(entity *postgres.WalTransactionEntity, changes []postgres.WalChangeEntity) error
+}
+
+type sqlxWalPersister struct {
+	db *sqlx.DB
+}
+
 type PostgresStreamer struct {
 	conn       *pgconn.PgConn
 	db         *sqlx.DB
+	persister  walPersister
 	slotName   string
 	relations  map[uint32]*pglogrepl.RelationMessage
 	currentTxn *transactionState
+	lastLSN    pglogrepl.LSN
 }
 
 func NewPostgresStreamer() (*PostgresStreamer, error) {
@@ -73,6 +87,7 @@ func NewPostgresStreamer() (*PostgresStreamer, error) {
 	return &PostgresStreamer{
 		conn:      conn,
 		db:        db,
+		persister: &sqlxWalPersister{db: db},
 		slotName:  slotName,
 		relations: make(map[uint32]*pglogrepl.RelationMessage),
 	}, nil
@@ -112,6 +127,98 @@ func (ps *PostgresStreamer) createReplicationSlot() error {
 	return nil
 }
 
+func (p *sqlxWalPersister) LoadCheckpoint(slotName string) (pglogrepl.LSN, error) {
+	var lsn string
+	err := p.db.Get(&lsn, `SELECT last_lsn::text FROM wal_checkpoint WHERE slot_name = $1`, slotName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to load checkpoint: %w", err)
+	}
+	checkpointLSN, err := pglogrepl.ParseLSN(lsn)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse checkpoint LSN: %w", err)
+	}
+	return checkpointLSN, nil
+}
+
+func (p *sqlxWalPersister) SaveCheckpoint(slotName string, lsn pglogrepl.LSN) error {
+	_, err := p.db.Exec(
+		`INSERT INTO wal_checkpoint (slot_name, last_lsn, updated_at) VALUES ($1, $2, now())
+		 ON CONFLICT (slot_name) DO UPDATE SET last_lsn = $2, updated_at = now()`,
+		slotName, lsn.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to save checkpoint: %w", err)
+	}
+	return nil
+}
+
+func (p *sqlxWalPersister) PersistTransaction(entity *postgres.WalTransactionEntity, changes []postgres.WalChangeEntity) error {
+	ctx := context.Background()
+	tx, err := p.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin DB transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	insertTxnQuery := `
+		INSERT INTO wal_transaction (source_slot, source_db, xid, begin_lsn, commit_lsn, commit_ts, change_count)
+		VALUES (:source_slot, :source_db, :xid, :begin_lsn, :commit_lsn, :commit_ts, :change_count)
+		ON CONFLICT (source_slot, commit_lsn) DO NOTHING
+		RETURNING id`
+
+	rows, err := tx.NamedQuery(insertTxnQuery, entity)
+	if err != nil {
+		return fmt.Errorf("failed to insert wal_transaction: %w", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return nil
+	}
+	if err := rows.Scan(&entity.ID); err != nil {
+		return fmt.Errorf("failed to scan transaction ID: %w", err)
+	}
+
+	insertChangeQuery := `
+		INSERT INTO wal_change (transaction_id, change_seq_in_txn, schema_name, table_name, table_oid, op, old_row, new_row, forward_dml_sql, reverse_dml_sql)
+		VALUES (:transaction_id, :change_seq_in_txn, :schema_name, :table_name, :table_oid, :op, :old_row, :new_row, :forward_dml_sql, :reverse_dml_sql)`
+
+	for i := range changes {
+		changes[i].TransactionID = entity.ID
+		if _, err := tx.NamedExec(insertChangeQuery, &changes[i]); err != nil {
+			return fmt.Errorf("failed to insert wal_change (seq=%d): %w", changes[i].ChangeSeqInTxn, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit DB transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (ps *PostgresStreamer) loadCheckpoint() (pglogrepl.LSN, error) {
+	lsn, err := ps.persister.LoadCheckpoint(ps.slotName)
+	if err != nil {
+		return 0, err
+	}
+	if lsn != 0 {
+		log.Printf("Loaded checkpoint LSN for slot %s: %s", ps.slotName, lsn.String())
+	}
+	return lsn, nil
+}
+
+func (ps *PostgresStreamer) saveCheckpoint(lsn pglogrepl.LSN) error {
+	if err := ps.persister.SaveCheckpoint(ps.slotName, lsn); err != nil {
+		return err
+	}
+	ps.lastLSN = lsn
+	return nil
+}
+
 func (ps *PostgresStreamer) dropReplicationSlot() error {
 	query := fmt.Sprintf("SELECT pg_drop_replication_slot('%s')", ps.slotName)
 	result := ps.conn.Exec(context.Background(), query)
@@ -125,20 +232,25 @@ func (ps *PostgresStreamer) dropReplicationSlot() error {
 }
 
 func (ps *PostgresStreamer) startReplication() error {
-	// Start logical replication using pglogrepl
+	lsn, err := ps.loadCheckpoint()
+	if err != nil {
+		return fmt.Errorf("failed to load checkpoint: %v", err)
+	}
+	ps.lastLSN = lsn
+
 	pluginArguments := []string{
 		"proto_version '1'",
 		"publication_names 'trail_replay_pub'",
 	}
 
-	err := pglogrepl.StartReplication(context.Background(), ps.conn, ps.slotName, 0, pglogrepl.StartReplicationOptions{
+	err = pglogrepl.StartReplication(context.Background(), ps.conn, ps.slotName, lsn, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArguments,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to start replication: %v", err)
 	}
 
-	log.Printf("Started logical replication on slot: %s", ps.slotName)
+	log.Printf("Started logical replication on slot: %s at LSN: %s", ps.slotName, lsn.String())
 	return nil
 }
 
@@ -346,8 +458,6 @@ func (ps *PostgresStreamer) persistCurrentTxn() {
 		return
 	}
 
-	ctx := context.Background()
-
 	txnEntity := &postgres.WalTransactionEntity{
 		SourceSlot:  ps.slotName,
 		SourceDb:    dbName,
@@ -360,37 +470,28 @@ func (ps *PostgresStreamer) persistCurrentTxn() {
 		txnEntity.BeginLSN = &txn.beginLSN
 	}
 
-	insertTxnQuery := `
-		INSERT INTO wal_transaction (source_slot, source_db, xid, begin_lsn, commit_lsn, commit_ts, change_count)
-		VALUES (:source_slot, :source_db, :xid, :begin_lsn, :commit_lsn, :commit_ts, :change_count)
-		RETURNING id`
+	commitLSN, parseErr := pglogrepl.ParseLSN(txn.commitLSN)
+	if parseErr != nil {
+		log.Printf("FAILED to parse commit LSN: %v", parseErr)
+		return
+	}
 
-	rows, err := ps.db.NamedQueryContext(ctx, insertTxnQuery, txnEntity)
-	if err != nil {
+	if err := ps.persister.PersistTransaction(txnEntity, txn.changes); err != nil {
 		log.Printf("FAILED to persist WAL transaction (xid=%d): %v", txn.xid, err)
 		return
 	}
-	if rows.Next() {
-		if err := rows.Scan(&txnEntity.ID); err != nil {
-			log.Printf("FAILED to scan transaction ID: %v", err)
-			rows.Close()
-			return
-		}
-	}
-	rows.Close()
-
-	insertChangeQuery := `
-		INSERT INTO wal_change (transaction_id, change_seq_in_txn, schema_name, table_name, table_oid, op, old_row, new_row, forward_dml_sql, reverse_dml_sql)
-		VALUES (:transaction_id, :change_seq_in_txn, :schema_name, :table_name, :table_oid, :op, :old_row, :new_row, :forward_dml_sql, :reverse_dml_sql)`
-
-	for _, ch := range txn.changes {
-		ch.TransactionID = txnEntity.ID
-		if _, err := ps.db.NamedExecContext(ctx, insertChangeQuery, ch); err != nil {
-			log.Printf("FAILED to persist WAL change (seq=%d): %v", ch.ChangeSeqInTxn, err)
-		}
-	}
-
 	log.Printf("[PERSISTED] WAL transaction %d with %d changes", txn.xid, len(txn.changes))
+
+	ps.persistCheckpoint(commitLSN)
+}
+
+func (ps *PostgresStreamer) persistCheckpoint(lsn pglogrepl.LSN) {
+	if lsn <= ps.lastLSN {
+		return
+	}
+	if err := ps.saveCheckpoint(lsn); err != nil {
+		log.Printf("FAILED to save checkpoint: %v", err)
+	}
 }
 
 func tupleToRow(rel *pglogrepl.RelationMessage, tuple *pglogrepl.TupleData) *postgres.PayloadJSON {
