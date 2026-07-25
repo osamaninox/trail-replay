@@ -483,6 +483,7 @@ func (ps *PostgresStreamer) persistCurrentTxn() {
 	log.Printf("[PERSISTED] WAL transaction %d with %d changes", txn.xid, len(txn.changes))
 
 	ps.persistCheckpoint(commitLSN)
+	ps.sendStandbyStatusUpdate(commitLSN)
 }
 
 func (ps *PostgresStreamer) persistCheckpoint(lsn pglogrepl.LSN) {
@@ -491,6 +492,18 @@ func (ps *PostgresStreamer) persistCheckpoint(lsn pglogrepl.LSN) {
 	}
 	if err := ps.saveCheckpoint(lsn); err != nil {
 		log.Printf("FAILED to save checkpoint: %v", err)
+	}
+}
+
+func (ps *PostgresStreamer) sendStandbyStatusUpdate(lsn pglogrepl.LSN) {
+	if ps.conn == nil {
+		return
+	}
+	err := pglogrepl.SendStandbyStatusUpdate(context.Background(), ps.conn, pglogrepl.StandbyStatusUpdate{
+		WALWritePosition: lsn,
+	})
+	if err != nil {
+		log.Printf("FAILED to send standby status update (LSN=%s): %v", lsn.String(), err)
 	}
 }
 
