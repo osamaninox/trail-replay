@@ -50,13 +50,14 @@ type sqlxWalPersister struct {
 }
 
 type PostgresStreamer struct {
-	conn       *pgconn.PgConn
-	db         *sqlx.DB
-	persister  walPersister
-	slotName   string
-	relations  map[uint32]*pglogrepl.RelationMessage
-	currentTxn *transactionState
-	lastLSN    pglogrepl.LSN
+	conn            *pgconn.PgConn
+	db              *sqlx.DB
+	persister       walPersister
+	slotName        string
+	relations       map[uint32]*pglogrepl.RelationMessage
+	currentTxn      *transactionState
+	lastLSN         pglogrepl.LSN
+	lastStandbySent time.Time
 }
 
 func NewPostgresStreamer() (*PostgresStreamer, error) {
@@ -165,30 +166,32 @@ func (p *sqlxWalPersister) PersistTransaction(entity *postgres.WalTransactionEnt
 
 	insertTxnQuery := `
 		INSERT INTO wal_transaction (source_slot, source_db, xid, begin_lsn, commit_lsn, commit_ts, change_count)
-		VALUES (:source_slot, :source_db, :xid, :begin_lsn, :commit_lsn, :commit_ts, :change_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (source_slot, commit_lsn) DO NOTHING
 		RETURNING id`
 
-	rows, err := tx.NamedQuery(insertTxnQuery, entity)
-	if err != nil {
+	if err := tx.QueryRow(insertTxnQuery,
+		entity.SourceSlot, entity.SourceDb, entity.Xid,
+		entity.BeginLSN, entity.CommitLSN, entity.CommitTS, entity.ChangeCount,
+	).Scan(&entity.ID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
 		return fmt.Errorf("failed to insert wal_transaction: %w", err)
-	}
-	defer rows.Close()
-
-	if !rows.Next() {
-		return nil
-	}
-	if err := rows.Scan(&entity.ID); err != nil {
-		return fmt.Errorf("failed to scan transaction ID: %w", err)
 	}
 
 	insertChangeQuery := `
 		INSERT INTO wal_change (transaction_id, change_seq_in_txn, schema_name, table_name, table_oid, op, old_row, new_row, forward_dml_sql, reverse_dml_sql)
-		VALUES (:transaction_id, :change_seq_in_txn, :schema_name, :table_name, :table_oid, :op, :old_row, :new_row, :forward_dml_sql, :reverse_dml_sql)`
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
 
 	for i := range changes {
 		changes[i].TransactionID = entity.ID
-		if _, err := tx.NamedExec(insertChangeQuery, &changes[i]); err != nil {
+		if _, err := tx.Exec(insertChangeQuery,
+			changes[i].TransactionID, changes[i].ChangeSeqInTxn,
+			changes[i].SchemaName, changes[i].TableName, changes[i].TableOID,
+			changes[i].Op, changes[i].OldRow, changes[i].NewRow,
+			changes[i].ForwardDMLSQL, changes[i].ReverseDMLSQL,
+		); err != nil {
 			return fmt.Errorf("failed to insert wal_change (seq=%d): %w", changes[i].ChangeSeqInTxn, err)
 		}
 	}
