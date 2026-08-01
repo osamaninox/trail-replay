@@ -506,6 +506,7 @@ func (ps *PostgresStreamer) sendStandbyStatusUpdate(lsn pglogrepl.LSN) {
 	err := pglogrepl.SendStandbyStatusUpdate(context.Background(), ps.conn, pglogrepl.StandbyStatusUpdate{
 		WALWritePosition: lsn,
 	})
+	ps.lastStandbySent = time.Now()
 	if err != nil {
 		log.Printf("FAILED to send standby status update (LSN=%s): %v", lsn.String(), err)
 	}
