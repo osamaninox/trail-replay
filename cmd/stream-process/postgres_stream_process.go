@@ -292,7 +292,11 @@ func (ps *PostgresStreamer) processCopyData(msg *pgproto3.CopyData) {
 	case 'w': // XLogData
 		ps.processXLogData(data[1:])
 	case 'k': // Primary keepalive message
-		log.Printf("[KEEPALIVE] Server keepalive message")
+		log.Printf("[KEEPALIVE] Replication slot keepalive message")
+		if time.Since(ps.lastStandbySent) > 10*time.Second && ps.lastLSN > 0 {
+			log.Printf("[KEEPALIVE] Stream process standby update")
+			ps.sendStandbyStatusUpdate(ps.lastLSN)
+		}
 	default:
 		log.Printf("[UNKNOWN] Message type: %c, Data: %x", msgType, data)
 	}
@@ -567,7 +571,7 @@ func (ps *PostgresStreamer) cleanup() {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
-	log.Println("PostgreSQL Logical Replication Stream POC")
+	log.Println("PostgreSQL Logical Replication Stream")
 	log.Println("=========================================")
 
 	streamer, err := NewPostgresStreamer()
