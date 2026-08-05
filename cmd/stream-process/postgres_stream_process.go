@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,9 +53,11 @@ type sqlxWalPersister struct {
 type PostgresStreamer struct {
 	conn            *pgconn.PgConn
 	db              *sqlx.DB
+	sourceDB        *sqlx.DB
 	persister       walPersister
 	slotName        string
 	relations       map[uint32]*pglogrepl.RelationMessage
+	relationPKs     map[uint32][]string
 	currentTxn      *transactionState
 	lastLSN         pglogrepl.LSN
 	lastStandbySent time.Time
@@ -85,12 +88,25 @@ func NewPostgresStreamer() (*PostgresStreamer, error) {
 		return nil, fmt.Errorf("failed to connect to database for persistence: %w", err)
 	}
 
+	// Source DB connection for metadata queries (PK lookup, etc.)
+	sourceDBConnString := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		dbHost, dbPort, dbUser, dbPassword, dbName)
+
+	sourceDB, err := sqlx.Connect("postgres", sourceDBConnString)
+	if err != nil {
+		db.Close()
+		conn.Close(context.Background())
+		return nil, fmt.Errorf("failed to connect to source database for metadata: %w", err)
+	}
+
 	return &PostgresStreamer{
-		conn:      conn,
-		db:        db,
-		persister: &sqlxWalPersister{db: db},
-		slotName:  slotName,
-		relations: make(map[uint32]*pglogrepl.RelationMessage),
+		conn:        conn,
+		db:          db,
+		sourceDB:    sourceDB,
+		persister:   &sqlxWalPersister{db: db},
+		slotName:    slotName,
+		relations:   make(map[uint32]*pglogrepl.RelationMessage),
+		relationPKs: make(map[uint32][]string),
 	}, nil
 }
 
@@ -376,6 +392,12 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 		}
 		ps.relations[m.RelationID] = m
 
+		if _, cached := ps.relationPKs[m.RelationID]; !cached {
+			pks := ps.loadRelationPKs(m.Namespace, m.RelationName)
+			ps.relationPKs[m.RelationID] = pks
+			log.Printf("[RELATION] PK columns for %s.%s: %v", m.Namespace, m.RelationName, pks)
+		}
+
 	case *pglogrepl.InsertMessage:
 		log.Printf("[%s] INSERT OPERATION", timestamp)
 		log.Printf("  Relation ID: %d", m.RelationID)
@@ -388,13 +410,20 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 		ps.printTupleData("  New Row", rel, m.Tuple)
 
 		if ps.currentTxn != nil {
+			pkCols := ps.getRelationPK(rel)
+			newRow := tupleToRow(rel, m.Tuple)
+			forwardDML := generateInsertSQL(rel.Namespace, rel.RelationName, newRow)
+			reverseDML := generateDeleteSQL(rel.Namespace, rel.RelationName, pkCols, newRow)
+
 			ps.currentTxn.changes = append(ps.currentTxn.changes, postgres.WalChangeEntity{
 				ChangeSeqInTxn: int32(len(ps.currentTxn.changes) + 1),
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
 				Op:             "I",
-				NewRow:         tupleToRow(rel, m.Tuple),
+				NewRow:         newRow,
+				ForwardDMLSQL:  forwardDML,
+				ReverseDMLSQL:  reverseDML,
 			})
 		}
 
@@ -413,14 +442,24 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 		ps.printTupleData("  New Row", rel, m.NewTuple)
 
 		if ps.currentTxn != nil {
+			pkCols := ps.getRelationPK(rel)
+			changedCols := diffTuples(rel, m.OldTuple, m.NewTuple)
+			oldRow := tupleToRow(rel, m.OldTuple)
+			newRow := tupleToRow(rel, m.NewTuple)
+			reverseDML := generateReverseDML(rel.Namespace, rel.RelationName, pkCols, changedCols, oldRow, newRow)
+			forwardDML := generateForwardDML(rel.Namespace, rel.RelationName, pkCols, changedCols, oldRow, newRow)
+
 			ps.currentTxn.changes = append(ps.currentTxn.changes, postgres.WalChangeEntity{
 				ChangeSeqInTxn: int32(len(ps.currentTxn.changes) + 1),
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
 				Op:             "U",
-				OldRow:         tupleToRow(rel, m.OldTuple),
-				NewRow:         tupleToRow(rel, m.NewTuple),
+				OldRow:         oldRow,
+				NewRow:         newRow,
+				ChangedColumns: changedCols,
+				ReverseDMLSQL:  reverseDML,
+				ForwardDMLSQL:  forwardDML,
 			})
 		}
 
@@ -438,13 +477,20 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 		}
 
 		if ps.currentTxn != nil {
+			pkCols := ps.getRelationPK(rel)
+			oldRow := tupleToRow(rel, m.OldTuple)
+			forwardDML := generateDeleteSQL(rel.Namespace, rel.RelationName, pkCols, oldRow)
+			reverseDML := generateInsertSQL(rel.Namespace, rel.RelationName, oldRow)
+
 			ps.currentTxn.changes = append(ps.currentTxn.changes, postgres.WalChangeEntity{
 				ChangeSeqInTxn: int32(len(ps.currentTxn.changes) + 1),
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
 				Op:             "D",
-				OldRow:         tupleToRow(rel, m.OldTuple),
+				OldRow:         oldRow,
+				ForwardDMLSQL:  forwardDML,
+				ReverseDMLSQL:  reverseDML,
 			})
 		}
 
@@ -562,8 +608,218 @@ func (ps *PostgresStreamer) printTupleData(prefix string, rel *pglogrepl.Relatio
 	}
 }
 
+func (ps *PostgresStreamer) loadRelationPKs(schema, table string) []string {
+	query := `
+		SELECT kcu.column_name
+		FROM information_schema.table_constraints tc
+		JOIN information_schema.key_column_usage kcu
+			ON tc.constraint_name = kcu.constraint_name
+			AND tc.table_schema = kcu.table_schema
+		WHERE tc.constraint_type = 'PRIMARY KEY'
+			AND tc.table_schema = $1
+			AND tc.table_name = $2
+		ORDER BY kcu.ordinal_position`
+
+	rows, err := ps.sourceDB.Query(query, schema, table)
+	if err != nil {
+		log.Printf("[WARN] failed to query PK columns for %s.%s: %v", schema, table, err)
+		return nil
+	}
+	defer rows.Close()
+
+	var pks []string
+	for rows.Next() {
+		var colName string
+		if err := rows.Scan(&colName); err != nil {
+			log.Printf("[WARN] failed to scan PK column for %s.%s: %v", schema, table, err)
+			continue
+		}
+		pks = append(pks, colName)
+	}
+	return pks
+}
+
+func (ps *PostgresStreamer) getRelationPK(rel *pglogrepl.RelationMessage) []string {
+	if pks, ok := ps.relationPKs[rel.RelationID]; ok {
+		return pks
+	}
+	var pks []string
+	for _, col := range rel.Columns {
+		if col.Flags == 1 {
+			pks = append(pks, col.Name)
+		}
+	}
+	ps.relationPKs[rel.RelationID] = pks
+	return pks
+}
+
+func diffTuples(rel *pglogrepl.RelationMessage, oldT, newT *pglogrepl.TupleData) []string {
+	var changed []string
+	for i := range newT.Columns {
+		if i >= len(rel.Columns) {
+			break
+		}
+		colName := rel.Columns[i].Name
+
+		if oldT == nil || i >= len(oldT.Columns) {
+			changed = append(changed, colName)
+			continue
+		}
+
+		oldCol := oldT.Columns[i]
+		newCol := newT.Columns[i]
+
+		if oldCol.DataType != newCol.DataType {
+			changed = append(changed, colName)
+			continue
+		}
+		if oldCol.DataType == 'n' && newCol.DataType == 'n' {
+			continue
+		}
+		if oldCol.DataType == 'u' || newCol.DataType == 'u' {
+			if oldCol.DataType != newCol.DataType {
+				changed = append(changed, colName)
+			}
+			continue
+		}
+		if string(oldCol.Data) != string(newCol.Data) {
+			changed = append(changed, colName)
+		}
+	}
+	return changed
+}
+
+func formatSQLValue(v any) string {
+	if v == nil {
+		return "NULL"
+	}
+	s := fmt.Sprintf("%v", v)
+	s = strings.ReplaceAll(s, "'", "''")
+	return "'" + s + "'"
+}
+
+func generateReverseDML(schema, table string, pkCols, changedCols []string, oldRow, newRow *postgres.PayloadJSON) string {
+	if oldRow == nil || *oldRow == nil {
+		return ""
+	}
+	o := *oldRow
+
+	setClauses := make([]string, 0, len(changedCols))
+	for _, col := range changedCols {
+		oldVal, ok := o[col]
+		if !ok {
+			continue
+		}
+		setClauses = append(setClauses, fmt.Sprintf("%s = %s", pgQuoteIdent(col), formatSQLValue(oldVal)))
+	}
+	if len(setClauses) == 0 {
+		return ""
+	}
+
+	whereClauses := make([]string, 0, len(pkCols))
+	rowForWhere := o
+	if newRow != nil && *newRow != nil {
+		rowForWhere = *newRow
+	}
+	for _, pk := range pkCols {
+		val, ok := rowForWhere[pk]
+		if !ok {
+			continue
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = %s", pgQuoteIdent(pk), formatSQLValue(val)))
+	}
+	if len(whereClauses) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
+		pgQuoteIdent(schema), pgQuoteIdent(table),
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+}
+
+func generateForwardDML(schema, table string, pkCols, changedCols []string, oldRow, newRow *postgres.PayloadJSON) string {
+	if newRow == nil || *newRow == nil {
+		return ""
+	}
+	n := *newRow
+
+	setClauses := make([]string, 0, len(changedCols))
+	for _, col := range changedCols {
+		newVal, ok := n[col]
+		if !ok {
+			continue
+		}
+		setClauses = append(setClauses, fmt.Sprintf("%s = %s", pgQuoteIdent(col), formatSQLValue(newVal)))
+	}
+	if len(setClauses) == 0 {
+		return ""
+	}
+
+	whereClauses := make([]string, 0, len(pkCols))
+	for _, pk := range pkCols {
+		val, ok := n[pk]
+		if !ok {
+			continue
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = %s", pgQuoteIdent(pk), formatSQLValue(val)))
+	}
+	if len(whereClauses) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("UPDATE %s.%s SET %s WHERE %s",
+		pgQuoteIdent(schema), pgQuoteIdent(table),
+		strings.Join(setClauses, ", "),
+		strings.Join(whereClauses, " AND "))
+}
+
+func pgQuoteIdent(ident string) string {
+	ident = strings.ReplaceAll(ident, "\"", "\"\"")
+	return "\"" + ident + "\""
+}
+
+func generateInsertSQL(schema, table string, row *postgres.PayloadJSON) string {
+	if row == nil || *row == nil {
+		return ""
+	}
+	r := *row
+	cols := make([]string, 0, len(r))
+	vals := make([]string, 0, len(r))
+	for col, val := range r {
+		cols = append(cols, pgQuoteIdent(col))
+		vals = append(vals, formatSQLValue(val))
+	}
+	return fmt.Sprintf("INSERT INTO %s.%s (%s) VALUES (%s)",
+		pgQuoteIdent(schema), pgQuoteIdent(table),
+		strings.Join(cols, ", "),
+		strings.Join(vals, ", "))
+}
+
+func generateDeleteSQL(schema, table string, pkCols []string, row *postgres.PayloadJSON) string {
+	if row == nil || *row == nil || len(pkCols) == 0 {
+		return ""
+	}
+	r := *row
+	whereClauses := make([]string, 0, len(pkCols))
+	for _, pk := range pkCols {
+		val, ok := r[pk]
+		if !ok {
+			continue
+		}
+		whereClauses = append(whereClauses, fmt.Sprintf("%s = %s", pgQuoteIdent(pk), formatSQLValue(val)))
+	}
+	if len(whereClauses) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("DELETE FROM %s.%s WHERE %s",
+		pgQuoteIdent(schema), pgQuoteIdent(table),
+		strings.Join(whereClauses, " AND "))
+}
+
 func (ps *PostgresStreamer) cleanup() {
 	if ps.db != nil {
+		ps.sourceDB.Close()
 		ps.db.Close()
 	}
 	if ps.conn != nil {
