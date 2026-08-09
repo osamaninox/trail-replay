@@ -1,0 +1,9 @@
+/.claude
+/.opencode
+/.rtk
+opencode.json
+
+# binaries
+/api
+/stream-process
+/migrate
