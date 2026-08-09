@@ -5,9 +5,9 @@ import (
 	"testing"
 
 	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage"
-	"github.com/osamakhalid/trail-replay/internal/core/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/ports/inbound"
-	"github.com/osamakhalid/trail-replay/internal/core/services"
+	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
+	"github.com/osamakhalid/trail-replay/internal/core/trail/ports/inbound"
+	"github.com/osamakhalid/trail-replay/internal/core/trail/services"
 )
 
 func newService() inbound.TrailService {

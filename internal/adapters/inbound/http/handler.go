@@ -10,11 +10,12 @@ import (
 )
 
 type Handler struct {
-	svc inbound.TrailService
+	svc    inbound.TrailService
+	walSvc inbound.WalQueryService
 }
 
-func NewHandler(svc inbound.TrailService) *Handler {
-	return &Handler{svc: svc}
+func NewHandler(svc inbound.TrailService, walSvc inbound.WalQueryService) *Handler {
+	return &Handler{svc: svc, walSvc: walSvc}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -23,6 +24,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /trails/{id}", h.getTrail)
 	mux.HandleFunc("POST /trails/{id}/events", h.appendEvent)
 	mux.HandleFunc("GET /trails/{id}/replay", h.replayTrail)
+	mux.HandleFunc("GET /wal/transactions", h.listWalTransactions)
 }
 
 func (h *Handler) createTrail(w http.ResponseWriter, r *http.Request) {
@@ -98,10 +100,34 @@ func (h *Handler) replayTrail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, events)
 }
 
+func (h *Handler) listWalTransactions(w http.ResponseWriter, r *http.Request) {
+	page := queryParamInt(r, "page", 1)
+	pageSize := queryParamInt(r, "page_size", 20)
+
+	result, err := h.walSvc.ListWalTransactions(r.Context(), page, pageSize)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
+}
+
+func queryParamInt(r *http.Request, key string, defaultVal int) int {
+	s := r.URL.Query().Get(key)
+	if s == "" {
+		return defaultVal
+	}
+	v, err := strconv.Atoi(s)
+	if err != nil {
+		return defaultVal
+	}
+	return v
 }
 
 func writeError(w http.ResponseWriter, status int, msg string) {

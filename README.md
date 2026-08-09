@@ -72,6 +72,7 @@ go run ./cmd/stream-process
 | `GET /trails/{id}` | — | Get a trail by ID |
 | `POST /trails/{id}/events` | `{ "type": "created", "payload": {} }` | Append an event |
 | `GET /trails/{id}/replay?from=1` | — | Replay events from a sequence |
+| `GET /wal/transactions?page=1&page_size=20` | — | List paginated WAL transactions with grouped wal_changes |
 
 ## Architecture
 
@@ -114,9 +115,26 @@ Environment variables:
 | `DB_USER` | `trailuser` | Database user |
 | `DB_PASSWORD` | `trailpass` | Database password |
 | `DB_NAME` | `traildb` | Database name |
+| `WAL_DB_NAME` | `trailwal` | WAL database name |
 
 ## Testing
+
+Unit tests (no external dependencies):
+
+```bash
+go test -short ./...
+```
+
+Integration tests (requires Docker for testcontainers):
+
+```bash
+go test ./internal/adapters/inbound/http/
+```
+
+Run all tests:
 
 ```bash
 go test ./...
 ```
+
+Integration tests require Docker to be running and will be skipped automatically with `-short` flag or when `CI=1 SKIP_INTEGRATION=1` is set.

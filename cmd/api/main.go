@@ -32,7 +32,18 @@ func main() {
 	}
 
 	svc := services.NewTrailService(repo)
-	h := httphandler.NewHandler(svc)
+
+	var walRepo outbound.WalQueryRepository
+	walDB, err := database.NewPostgresConnection(cfg.WalDatabase)
+	if err != nil {
+		slog.Warn("failed to connect to WAL database, /wal/transactions will not be available", "error", err)
+	} else {
+		slog.Info("connected to WAL database")
+		walRepo = postgres.NewWalQueryRepository(walDB)
+	}
+	walSvc := services.NewWalQueryService(walRepo)
+
+	h := httphandler.NewHandler(svc, walSvc)
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
