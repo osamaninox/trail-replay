@@ -196,20 +196,39 @@ func (p *sqlxWalPersister) PersistTransaction(entity *postgres.WalTransactionEnt
 		return fmt.Errorf("failed to insert wal_transaction: %w", err)
 	}
 
-	insertChangeQuery := `
-		INSERT INTO wal_change (transaction_id, change_seq_in_txn, schema_name, table_name, table_oid, op, old_row, new_row, forward_dml_sql, reverse_dml_sql)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+	if len(changes) == 0 {
+		return tx.Commit()
+	}
+
+	const colsPerRow = 10
+	valuePlaceholders := make([]string, 0, len(changes))
+	args := make([]interface{}, 0, len(changes)*colsPerRow)
 
 	for i := range changes {
-		changes[i].TransactionID = entity.ID
-		if _, err := tx.Exec(insertChangeQuery,
-			changes[i].TransactionID, changes[i].ChangeSeqInTxn,
-			changes[i].SchemaName, changes[i].TableName, changes[i].TableOID,
-			changes[i].Op, changes[i].OldRow, changes[i].NewRow,
-			changes[i].ForwardDMLSQL, changes[i].ReverseDMLSQL,
-		); err != nil {
-			return fmt.Errorf("failed to insert wal_change (seq=%d): %w", changes[i].ChangeSeqInTxn, err)
-		}
+		base := i * colsPerRow
+		valuePlaceholders = append(valuePlaceholders, fmt.Sprintf(
+			"($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+			base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10,
+		))
+		args = append(args,
+			entity.ID,
+			changes[i].ChangeSeqInTxn,
+			changes[i].SchemaName,
+			changes[i].TableName,
+			changes[i].TableOID,
+			changes[i].Op,
+			changes[i].OldRow,
+			changes[i].NewRow,
+			changes[i].ForwardDMLSQL,
+			changes[i].ReverseDMLSQL,
+		)
+	}
+
+	query := fmt.Sprintf(`INSERT INTO wal_change (transaction_id, change_seq_in_txn, schema_name, table_name, table_oid, op, old_row, new_row, forward_dml_sql, reverse_dml_sql) VALUES %s`,
+		strings.Join(valuePlaceholders, ","))
+
+	if _, err := tx.Exec(query, args...); err != nil {
+		return fmt.Errorf("failed to insert wal_changes: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -420,8 +439,9 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
-				Op:             "INSERT",
+				Op:             "I",
 				NewRow:         newRow,
+				ChangedColumns: []string{},
 				ForwardDMLSQL:  forwardDML,
 				ReverseDMLSQL:  reverseDML,
 			})
@@ -454,7 +474,7 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
-				Op:             "UPDATE",
+				Op:             "U",
 				OldRow:         oldRow,
 				NewRow:         newRow,
 				ChangedColumns: changedCols,
@@ -487,8 +507,9 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 				SchemaName:     rel.Namespace,
 				TableName:      rel.RelationName,
 				TableOID:       &m.RelationID,
-				Op:             "DELETE",
+				Op:             "D",
 				OldRow:         oldRow,
+				ChangedColumns: []string{},
 				ForwardDMLSQL:  forwardDML,
 				ReverseDMLSQL:  reverseDML,
 			})
@@ -700,6 +721,7 @@ func formatSQLValue(v any) string {
 
 func generateReverseDML(schema, table string, pkCols, changedCols []string, oldRow, newRow *postgres.PayloadJSON) string {
 	if oldRow == nil || *oldRow == nil {
+		log.Printf("[WARN] No old row data for %s.%s — reverse DML requires REPLICA IDENTITY FULL", schema, table)
 		return ""
 	}
 	o := *oldRow

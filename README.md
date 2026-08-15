@@ -63,6 +63,15 @@ go run ./cmd/migrate -wal
 go run ./cmd/stream-process
 ```
 
+> **Important for revert workflows:** The stream processor generates reverse DML SQL to support data reverts. For this to work, PostgreSQL must include old row values in UPDATE/DELETE WAL messages. Enable `REPLICA IDENTITY FULL` on tables you want to be revertable:
+>
+> ```sql
+> ALTER TABLE public.orders REPLICA IDENTITY FULL;
+> ALTER TABLE public.events REPLICA IDENTITY FULL;
+> ```
+>
+> Without this, reverts for those tables will be skipped since old row data is unavailable.
+
 ## API Endpoints
 
 | Method | Path | Description |
