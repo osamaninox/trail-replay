@@ -845,7 +845,6 @@ func (ps *PostgresStreamer) cleanup() {
 		ps.db.Close()
 	}
 	if ps.conn != nil {
-		ps.dropReplicationSlot()
 		ps.conn.Close(context.Background())
 	}
 }
