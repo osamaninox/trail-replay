@@ -18,6 +18,12 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    # Cap WAL retained per replication slot: if the consumer falls too far
+    # behind, PostgreSQL invalidates the slot instead of filling the disk.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_slot_wal_keep_size=50GB"
     environment:
       - POSTGRES_USER=trailuser
       - POSTGRES_PASSWORD=trailpass
