@@ -1,0 +1,53 @@
+# Trail Replay — PostgreSQL WAL stream process
+#
+# Install:
+#   go build -o /tmp/trail-replay-stream ./cmd/stream-process
+#   sudo install -m 0755 /tmp/trail-replay-stream /usr/local/bin/trail-replay-stream
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin trailreplay
+#   sudo install -d -o trailreplay -g trailreplay /var/lib/trail-replay
+#   sudo cp deploy/systemd/trail-replay-stream.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now trail-replay-stream
+#
+# Manage:
+#   systemctl status trail-replay-stream
+#   journalctl -u trail-replay-stream -f
+
+[Unit]
+Description=Trail Replay - PostgreSQL WAL stream process
+After=network-online.target postgresql.service docker.service
+Wants=network-online.target
+# Bail out (instead of hot-looping forever) if it crashes more than
+# 5 times within 60 seconds — a crash-looping service needs a human.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trailreplay
+Group=trailreplay
+ExecStart=/usr/local/bin/trail-replay-stream
+WorkingDirectory=/var/lib/trail-replay
+
+# --- Supervision & auto-restart ---
+# systemd watches the PID and respawns it on any exit (clean or crash).
+Restart=always
+RestartSec=5s
+
+# Optional env overrides; ignored if the file is absent. The binary
+# currently uses compiled-in defaults until config is externalized
+# (see TODO.md "Externalize config").
+EnvironmentFile=-/etc/trail-replay/stream.env
+
+# Graceful stop: the process handles SIGINT/SIGTERM via signal.Notify.
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# Minimal hardening
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

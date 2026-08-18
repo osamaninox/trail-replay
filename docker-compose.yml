@@ -1,6 +1,7 @@
 services:
   app:
     build: .
+    restart: unless-stopped
     ports:
       - "8080:8080"
     environment:
@@ -18,6 +19,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     # Cap WAL retained per replication slot: if the consumer falls too far
     # behind, PostgreSQL invalidates the slot instead of filling the disk.
     command:
