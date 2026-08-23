@@ -6,8 +6,8 @@ import (
 	"fmt"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/ports/outbound"
+	"trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/ports/outbound"
 )
 
 type postgresRepository struct {

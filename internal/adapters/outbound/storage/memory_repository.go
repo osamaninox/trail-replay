@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/domain"
 )
 
 type inMemoryRepository struct {

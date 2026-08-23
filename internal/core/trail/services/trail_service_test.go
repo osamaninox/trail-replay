@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/ports/inbound"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/services"
+	"trail-replay/internal/adapters/outbound/storage"
+	"trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/ports/inbound"
+	"trail-replay/internal/core/trail/services"
 )
 
 func newService() inbound.TrailService {

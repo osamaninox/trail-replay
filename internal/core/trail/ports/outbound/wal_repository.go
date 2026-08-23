@@ -3,7 +3,7 @@ package outbound
 import (
 	"context"
 
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/domain"
 )
 
 type WalQueryRepository interface {

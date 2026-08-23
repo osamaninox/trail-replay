@@ -3,7 +3,7 @@ package inbound
 import (
 	"context"
 
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/domain"
 )
 
 // TrailService is the driving port — defines operations the application exposes.

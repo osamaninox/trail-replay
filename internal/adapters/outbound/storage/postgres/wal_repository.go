@@ -7,8 +7,8 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/ports/outbound"
+	"trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/ports/outbound"
 )
 
 type walQueryRepository struct {

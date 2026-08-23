@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/services"
+	"trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/services"
 )
 
 type mockWalQueryRepository struct {

@@ -5,7 +5,7 @@ import (
 
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
-	"github.com/osamakhalid/trail-replay/pkg/config"
+	"trail-replay/pkg/config"
 )
 
 func NewPostgresConnection(cfg config.DatabaseConfig) (*sqlx.DB, error) {

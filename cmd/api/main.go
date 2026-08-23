@@ -5,13 +5,13 @@ import (
 	"net/http"
 	"os"
 
-	httphandler "github.com/osamakhalid/trail-replay/internal/adapters/inbound/http"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage/postgres"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/ports/outbound"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/services"
-	"github.com/osamakhalid/trail-replay/pkg/config"
-	"github.com/osamakhalid/trail-replay/pkg/database"
+	httphandler "trail-replay/internal/adapters/inbound/http"
+	"trail-replay/internal/adapters/outbound/storage"
+	"trail-replay/internal/adapters/outbound/storage/postgres"
+	"trail-replay/internal/core/trail/ports/outbound"
+	"trail-replay/internal/core/trail/services"
+	"trail-replay/pkg/config"
+	"trail-replay/pkg/database"
 )
 
 func main() {

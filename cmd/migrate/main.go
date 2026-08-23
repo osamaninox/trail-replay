@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 
 	_ "github.com/lib/pq"
-	"github.com/osamakhalid/trail-replay/pkg/config"
+	"trail-replay/pkg/config"
 	"github.com/pressly/goose/v3"
 )
 

@@ -16,11 +16,11 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	httphandler "github.com/osamakhalid/trail-replay/internal/adapters/inbound/http"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage/postgres"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/services"
+	httphandler "trail-replay/internal/adapters/inbound/http"
+	"trail-replay/internal/adapters/outbound/storage"
+	"trail-replay/internal/adapters/outbound/storage/postgres"
+	"trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/services"
 )
 
 func skipShortCI(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
-	"github.com/osamakhalid/trail-replay/internal/core/trail/domain"
+	"trail-replay/internal/core/trail/domain"
 )
 
 // DomainEntity represents any entity that can be converted to/from domain models
