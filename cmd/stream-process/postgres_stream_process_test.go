@@ -1,13 +1,17 @@
 package main
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage/postgres"
+	"github.com/lib/pq"
+	"trail-replay/internal/adapters/outbound/storage/postgres"
 )
 
 type mockPersister struct {
@@ -880,6 +884,187 @@ func TestPersistCurrentTxn_InvalidCommitLSN(t *testing.T) {
 	ps.persistCurrentTxn()
 	if m.persistCalls != 0 {
 		t.Errorf("expected no persist for invalid LSN, got %d", m.persistCalls)
+	}
+}
+
+// --- reconnection loop: backoff, error classification, run() ---
+
+func TestBackoff_DoublesUntilMax(t *testing.T) {
+	b := newBackoff(1*time.Second, 8*time.Second, 10*time.Second)
+	want := []time.Duration{1, 2, 4, 8, 8, 8}
+	for i, w := range want {
+		if got := b.next(); got != w*time.Second {
+			t.Errorf("next() call %d = %s, want %s", i+1, got, w*time.Second)
+		}
+	}
+}
+
+func TestBackoff_Reset(t *testing.T) {
+	b := newBackoff(1*time.Second, 8*time.Second, 10*time.Second)
+	b.next()
+	b.next()
+	b.reset()
+	if got := b.next(); got != 1*time.Second {
+		t.Errorf("after reset, next() = %s, want 1s", got)
+	}
+}
+
+func TestClassifyPgError_UnrecoverableSQLStates(t *testing.T) {
+	codes := []string{"28000", "28P01", "3D000", "42501", "42704"}
+	for _, code := range codes {
+		err := classifyPgError(&pgconn.PgError{Code: code, Message: "boom"})
+		if !isUnrecoverable(err) {
+			t.Errorf("SQLSTATE %s: expected unrecoverable, got transient", code)
+		}
+	}
+}
+
+func TestClassifyPgError_PQDriverError(t *testing.T) {
+	err := classifyPgError(&pq.Error{Code: "28P01", Message: "password authentication failed"})
+	if !isUnrecoverable(err) {
+		t.Error("pq.Error 28P01: expected unrecoverable")
+	}
+}
+
+func TestClassifyPgError_InvalidatedSlot(t *testing.T) {
+	err := classifyPgError(&pgconn.PgError{
+		Code:    "55000",
+		Message: `replication slot "trail_replay_poc_slot" is invalidated`,
+	})
+	if !isUnrecoverable(err) {
+		t.Error("invalidated slot: expected unrecoverable")
+	}
+}
+
+func TestClassifyPgError_TransientErrorsPassThrough(t *testing.T) {
+	transient := []error{
+		errors.New("connection reset by peer"),
+		&pgconn.PgError{Code: "57P01", Message: "terminating connection due to administrator command"},
+		&pgconn.PgError{Code: "08006", Message: "connection failure"},
+	}
+	for _, err := range transient {
+		got := classifyPgError(err)
+		if got != err {
+			t.Errorf("expected passthrough for %v, got %v", err, got)
+		}
+		if isUnrecoverable(got) {
+			t.Errorf("expected transient for %v", err)
+		}
+	}
+}
+
+func TestIsUnrecoverable_Wrapped(t *testing.T) {
+	base := &unrecoverableError{err: errors.New("slot dropped")}
+	if !isUnrecoverable(fmt.Errorf("outer: %w", base)) {
+		t.Error("expected errors.As to unwrap unrecoverableError")
+	}
+	if isUnrecoverable(fmt.Errorf("outer: %w", errors.New("nope"))) {
+		t.Error("plain wrapped error should be transient")
+	}
+}
+
+func TestRun_UnrecoverableStopsImmediately(t *testing.T) {
+	calls := 0
+	want := &unrecoverableError{err: errors.New("slot dropped")}
+	streamFn := func(ctx context.Context) error {
+		calls++
+		return want
+	}
+	got := run(context.Background(), streamFn, newBackoff(time.Millisecond, 5*time.Millisecond, 50*time.Millisecond))
+	if got != want {
+		t.Fatalf("run() = %v, want %v", got, want)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 attempt, got %d", calls)
+	}
+}
+
+func TestRun_RetriesTransientUntilShutdown(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	streamFn := func(ctx context.Context) error {
+		calls++
+		if calls == 3 {
+			cancel() // simulate SIGTERM after the 3rd failure
+		}
+		return errors.New("connection reset")
+	}
+	if err := run(ctx, streamFn, newBackoff(time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)); err != nil {
+		t.Fatalf("run() = %v, want nil on shutdown", err)
+	}
+	if calls != 3 {
+		t.Errorf("expected 3 attempts, got %d", calls)
+	}
+}
+
+func TestRun_CancelDuringBackoffSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	streamFn := func(ctx context.Context) error {
+		calls++
+		return errors.New("connection reset")
+	}
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	if err := run(ctx, streamFn, newBackoff(time.Hour, time.Hour, time.Hour)); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 attempt, got %d", calls)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("run() blocked on backoff despite cancellation (took %s)", elapsed)
+	}
+}
+
+func TestRun_ResetsBackoffAfterHealthyRun(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	bo := newBackoff(time.Millisecond, 100*time.Millisecond, 20*time.Millisecond)
+	calls := 0
+	streamFn := func(ctx context.Context) error {
+		calls++
+		if calls == 2 {
+			time.Sleep(30 * time.Millisecond) // second run exceeds healthyAfter
+		}
+		if calls == 3 {
+			cancel()
+		}
+		return errors.New("connection reset")
+	}
+	if err := run(ctx, streamFn, bo); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	// Attempt 1 fails instantly: next() returns 1ms, cur grows to 2ms.
+	// Attempt 2 stays up 30ms > healthyAfter: reset to min, then next()
+	// returns 1ms and cur grows to 2ms again. Without the reset, cur would
+	// be 4ms by now.
+	if bo.cur != 2*time.Millisecond {
+		t.Errorf("bo.cur = %s, want 2ms (healthy run should reset backoff)", bo.cur)
+	}
+}
+
+func TestRun_NilErrorReconnects(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	streamFn := func(ctx context.Context) error {
+		calls++
+		if calls == 2 {
+			cancel()
+		}
+		return nil // stream ended without error — should reconnect, not exit
+	}
+	if err := run(ctx, streamFn, newBackoff(time.Millisecond, 5*time.Millisecond, 50*time.Millisecond)); err != nil {
+		t.Fatalf("run() = %v, want nil", err)
+	}
+	if calls < 2 {
+		t.Errorf("expected reconnect after nil error, got %d attempt(s)", calls)
 	}
 }
 

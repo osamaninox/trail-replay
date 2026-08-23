@@ -16,7 +16,9 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jmoiron/sqlx"
-	"github.com/osamakhalid/trail-replay/internal/adapters/outbound/storage/postgres"
+	"github.com/lib/pq"
+	"trail-replay/internal/adapters/outbound/storage/postgres"
+	pgdb "trail-replay/pkg/database"
 )
 
 const (
@@ -31,6 +33,73 @@ const (
 	// Replication slot name for our POC
 	slotName = "trail_replay_poc_slot"
 )
+
+// unrecoverableError marks failures that retrying cannot fix (invalid config,
+// dropped/invalidated replication slot, auth or permission errors). Anything
+// else — network blips, PG restarts — is treated as transient and retried.
+type unrecoverableError struct{ err error }
+
+func (e *unrecoverableError) Error() string { return e.err.Error() }
+func (e *unrecoverableError) Unwrap() error { return e.err }
+
+func isUnrecoverable(err error) bool {
+	var ue *unrecoverableError
+	return errors.As(err, &ue)
+}
+
+// isUnrecoverablePgError reports whether a SQLSTATE / message pair describes
+// a failure that retrying can never fix.
+func isUnrecoverablePgError(code, message string) bool {
+	switch code {
+	case pgdb.PgCodeInvalidAuthorization,
+		pgdb.PgCodeInvalidPassword,
+		pgdb.PgCodeInvalidCatalogName,
+		pgdb.PgCodeInsufficientPrivilege,
+		pgdb.PgCodeUndefinedObject:
+		return true
+	}
+	// PG 15+: starting replication on an invalidated slot (WAL trimmed past
+	// the slot's restart LSN) can never succeed again.
+	return strings.Contains(message, "replication slot") && strings.Contains(message, "invalidated")
+}
+
+// classifyPgError wraps err in unrecoverableError when it carries a
+// non-retryable SQLSTATE; otherwise it returns err unchanged (transient).
+func classifyPgError(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && isUnrecoverablePgError(pgErr.Code, pgErr.Message) {
+		return &unrecoverableError{err: err}
+	}
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && isUnrecoverablePgError(string(pqErr.Code), pqErr.Message) {
+		return &unrecoverableError{err: err}
+	}
+	return err
+}
+
+// backoff implements exponential backoff between reconnection attempts:
+// it doubles each wait from min up to max. A run that lasted at least
+// healthyAfter is considered healthy and resets the backoff via reset().
+type backoff struct {
+	min, max     time.Duration
+	healthyAfter time.Duration
+	cur          time.Duration
+}
+
+func newBackoff(min, max, healthyAfter time.Duration) *backoff {
+	return &backoff{min: min, max: max, healthyAfter: healthyAfter, cur: min}
+}
+
+func (b *backoff) next() time.Duration {
+	d := b.cur
+	b.cur *= 2
+	if b.cur > b.max {
+		b.cur = b.max
+	}
+	return d
+}
+
+func (b *backoff) reset() { b.cur = b.min }
 
 type transactionState struct {
 	xid       int64
@@ -63,40 +132,41 @@ type PostgresStreamer struct {
 	lastStandbySent time.Time
 }
 
-func NewPostgresStreamer() (*PostgresStreamer, error) {
+func NewPostgresStreamer(ctx context.Context) (*PostgresStreamer, error) {
 	// Replication connection for WAL streaming
 	connString := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s replication=database",
 		dbHost, dbPort, dbUser, dbPassword, dbName)
 
 	config, err := pgconn.ParseConfig(connString)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse replication config: %w", err)
+		// Bad connection config can never be fixed by retrying.
+		return nil, &unrecoverableError{err: fmt.Errorf("failed to parse replication config: %w", err)}
 	}
 
-	conn, err := pgconn.ConnectConfig(context.Background(), config)
+	conn, err := pgconn.ConnectConfig(ctx, config)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect for replication: %w", err)
+		return nil, classifyPgError(fmt.Errorf("failed to connect for replication: %w", err))
 	}
 
 	// Regular DB connection for persisting WAL changes (separate DB to avoid recursion)
 	dbConnString := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		dbHost, dbPort, dbUser, dbPassword, walDBName)
 
-	db, err := sqlx.Connect("postgres", dbConnString)
+	db, err := sqlx.ConnectContext(ctx, "postgres", dbConnString)
 	if err != nil {
 		conn.Close(context.Background())
-		return nil, fmt.Errorf("failed to connect to database for persistence: %w", err)
+		return nil, classifyPgError(fmt.Errorf("failed to connect to database for persistence: %w", err))
 	}
 
 	// Source DB connection for metadata queries (PK lookup, etc.)
 	sourceDBConnString := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
 		dbHost, dbPort, dbUser, dbPassword, dbName)
 
-	sourceDB, err := sqlx.Connect("postgres", sourceDBConnString)
+	sourceDB, err := sqlx.ConnectContext(ctx, "postgres", sourceDBConnString)
 	if err != nil {
 		db.Close()
 		conn.Close(context.Background())
-		return nil, fmt.Errorf("failed to connect to source database for metadata: %w", err)
+		return nil, classifyPgError(fmt.Errorf("failed to connect to source database for metadata: %w", err))
 	}
 
 	return &PostgresStreamer{
@@ -110,17 +180,17 @@ func NewPostgresStreamer() (*PostgresStreamer, error) {
 	}, nil
 }
 
-func (ps *PostgresStreamer) createReplicationSlot() error {
+func (ps *PostgresStreamer) createReplicationSlot(ctx context.Context) error {
 	// First, create a publication for all tables
 	pubQuery := "CREATE PUBLICATION trail_replay_pub FOR ALL TABLES"
-	result := ps.conn.Exec(context.Background(), pubQuery)
+	result := ps.conn.Exec(ctx, pubQuery)
 	_, err := result.ReadAll()
 	if err != nil {
 		// Check if publication already exists
 		if pgErr, ok := err.(*pgconn.PgError); ok && pgErr.Code == "42710" {
 			log.Printf("Publication 'trail_replay_pub' already exists, continuing...")
 		} else {
-			return fmt.Errorf("failed to create publication: %v", err)
+			return classifyPgError(fmt.Errorf("failed to create publication: %v", err))
 		}
 	} else {
 		log.Printf("Created publication: trail_replay_pub")
@@ -129,7 +199,7 @@ func (ps *PostgresStreamer) createReplicationSlot() error {
 	// Create logical replication slot using pgoutput plugin
 	query := fmt.Sprintf("SELECT pg_create_logical_replication_slot('%s', 'pgoutput')", ps.slotName)
 
-	result = ps.conn.Exec(context.Background(), query)
+	result = ps.conn.Exec(ctx, query)
 	_, err = result.ReadAll()
 	if err != nil {
 		// Check if slot already exists
@@ -137,7 +207,7 @@ func (ps *PostgresStreamer) createReplicationSlot() error {
 			log.Printf("Replication slot '%s' already exists, continuing...", ps.slotName)
 			return nil
 		}
-		return fmt.Errorf("failed to create replication slot: %v", err)
+		return classifyPgError(fmt.Errorf("failed to create replication slot: %v", err))
 	}
 
 	log.Printf("Created replication slot: %s", ps.slotName)
@@ -269,7 +339,7 @@ func (ps *PostgresStreamer) dropReplicationSlot() error {
 	return nil
 }
 
-func (ps *PostgresStreamer) startReplication() error {
+func (ps *PostgresStreamer) startReplication(ctx context.Context) error {
 	lsn, err := ps.loadCheckpoint()
 	if err != nil {
 		return fmt.Errorf("failed to load checkpoint: %v", err)
@@ -281,28 +351,31 @@ func (ps *PostgresStreamer) startReplication() error {
 		"publication_names 'trail_replay_pub'",
 	}
 
-	err = pglogrepl.StartReplication(context.Background(), ps.conn, ps.slotName, lsn, pglogrepl.StartReplicationOptions{
+	err = pglogrepl.StartReplication(ctx, ps.conn, ps.slotName, lsn, pglogrepl.StartReplicationOptions{
 		PluginArgs: pluginArguments,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to start replication: %v", err)
+		return classifyPgError(fmt.Errorf("failed to start replication: %v", err))
 	}
 
 	log.Printf("Started logical replication on slot: %s at LSN: %s", ps.slotName, lsn.String())
 	return nil
 }
 
-func (ps *PostgresStreamer) streamChanges() error {
+func (ps *PostgresStreamer) streamChanges(ctx context.Context) error {
 	log.Println("Starting to stream changes...")
 	log.Println("===== PostgreSQL Logical Replication Stream Output =====")
 	log.Println("Waiting for database changes... (make some INSERT/UPDATE/DELETE operations)")
 
 	for {
-		// No timeout - wait indefinitely for messages
-		msg, err := ps.conn.ReceiveMessage(context.Background())
+		// Blocks until a message arrives or ctx is cancelled (shutdown signal).
+		msg, err := ps.conn.ReceiveMessage(ctx)
 
 		if err != nil {
-			return fmt.Errorf("failed to receive message: %v", err)
+			if ctx.Err() != nil {
+				return nil // graceful shutdown requested
+			}
+			return classifyPgError(fmt.Errorf("failed to receive message: %v", err))
 		}
 
 		switch msg := msg.(type) {
@@ -310,6 +383,14 @@ func (ps *PostgresStreamer) streamChanges() error {
 			ps.processCopyData(msg)
 		case *pgproto3.ErrorResponse:
 			log.Printf("ERROR: %s", msg.Message)
+			pgErr := fmt.Errorf("postgres error (SQLSTATE %s): %s", msg.Code, msg.Message)
+			if isUnrecoverablePgError(msg.Code, msg.Message) {
+				return &unrecoverableError{err: pgErr}
+			}
+			if msg.Severity == "FATAL" || msg.Severity == "PANIC" {
+				// The server is about to drop the connection; reconnect.
+				return pgErr
+			}
 		default:
 			log.Printf("Received message type: %T", msg)
 		}
@@ -849,40 +930,79 @@ func (ps *PostgresStreamer) cleanup() {
 	}
 }
 
+// run streams WAL changes, reconnecting with exponential backoff whenever a
+// transient failure (network blip, PG restart) kills the stream. It returns
+// nil on graceful shutdown (ctx cancelled) and non-nil only for unrecoverable
+// errors that retrying cannot fix — the process exits and leaves those to
+// external supervision.
+func run(ctx context.Context, streamFn func(ctx context.Context) error, backOff *backoff) error {
+	for attempt := 1; ; attempt++ {
+		start := time.Now()
+		err := streamFn(ctx)
+
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err == nil {
+			log.Printf("Stream ended unexpectedly; reconnecting")
+		} else if isUnrecoverable(err) {
+			return err
+		} else {
+			log.Printf("Stream connection lost (attempt %d): %v", attempt, err)
+		}
+
+		// A run that stayed up a while was healthy; the next failure restarts
+		// the backoff from the minimum delay.
+		if time.Since(start) >= backOff.healthyAfter {
+			backOff.reset()
+		}
+		wait := backOff.next()
+		log.Printf("Reconnecting in %s...", wait)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+	}
+}
+
+// streamOnce performs one full connect → setup → stream cycle. The caller
+// decides, based on the classified error, whether to retry or give up.
+func streamOnce(ctx context.Context) error {
+	streamer, err := NewPostgresStreamer(ctx)
+	if err != nil {
+		return err
+	}
+	defer streamer.cleanup()
+
+	// Create replication slot (idempotent — resumes from the persisted checkpoint)
+	if err := streamer.createReplicationSlot(ctx); err != nil {
+		return err
+	}
+
+	// Start replication from the last persisted LSN
+	if err := streamer.startReplication(ctx); err != nil {
+		return err
+	}
+
+	// Stream changes until the connection drops or shutdown is requested
+	return streamer.streamChanges(ctx)
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
 	log.Println("PostgreSQL Logical Replication Stream")
 	log.Println("=========================================")
 
-	streamer, err := NewPostgresStreamer()
-	if err != nil {
-		log.Fatalf("Failed to create streamer: %v", err)
+	// SIGINT/SIGTERM cancel the context, which unblocks ReceiveMessage and
+	// runs cleanup via streamOnce's defer — no more os.Exit mid-stream.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	backOff := newBackoff(1*time.Second, 60*time.Second, 10*time.Second)
+	if err := run(ctx, streamOnce, backOff); err != nil {
+		log.Fatalf("Unrecoverable error, exiting: %v", err)
 	}
-
-	// Setup graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("\nReceived shutdown signal, cleaning up...")
-		streamer.cleanup()
-		os.Exit(0)
-	}()
-
-	// Create replication slot
-	if err := streamer.createReplicationSlot(); err != nil {
-		log.Fatalf("Failed to create replication slot: %v", err)
-	}
-
-	// Start replication
-	if err := streamer.startReplication(); err != nil {
-		log.Fatalf("Failed to start replication: %v", err)
-	}
-
-	// Stream changes
-	if err := streamer.streamChanges(); err != nil {
-		log.Fatalf("Failed to stream changes: %v", err)
-	}
+	log.Println("Shutdown complete.")
 }
