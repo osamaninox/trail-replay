@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -20,7 +21,6 @@ func main() {
 
 	cfg := config.Load()
 
-	// Try PostgreSQL first, fallback to in-memory
 	var repo outbound.TrailRepository
 	db, err := database.NewPostgresConnection(cfg.Database)
 	if err != nil {
@@ -43,10 +43,30 @@ func main() {
 	}
 	walSvc := services.NewWalQueryService(walRepo)
 
+	var revertHandler *httphandler.RevertHandler
+
+	if walDB != nil {
+		revertRepo := postgres.NewRevertRepository(walDB)
+		jobCreated := make(chan struct{}, 1)
+		revertSvc := services.NewRevertService(revertRepo, jobCreated)
+		revertHandler = httphandler.NewRevertHandler(revertSvc)
+
+		if db != nil {
+			sourceExecutor := postgres.NewSourceDBExecutor(db)
+			services.StartRevertJobRunner(context.Background(), revertRepo, sourceExecutor, jobCreated)
+			slog.Info("revert job runner started")
+		} else {
+			slog.Warn("source database not available, revert job runner will not be started")
+		}
+	}
+
 	h := httphandler.NewHandler(svc, walSvc)
 
 	mux := http.NewServeMux()
 	h.RegisterRoutes(mux)
+	if revertHandler != nil {
+		revertHandler.RegisterRoutes(mux)
+	}
 
 	slog.Info("starting server", "addr", cfg.HTTPAddr)
 	if err := http.ListenAndServe(cfg.HTTPAddr, mux); err != nil {

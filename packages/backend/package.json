@@ -1,0 +1,12 @@
+{
+  "name": "@trail-replay/backend",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "api": "go run ./cmd/api",
+    "stream": "go run ./cmd/stream-process",
+    "migrate": "go run ./cmd/migrate",
+    "test": "go test ./...",
+    "test:unit": "go test -short ./..."
+  }
+}

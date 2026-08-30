@@ -1,9 +1,10 @@
+/node_modules
 /.claude
 /.opencode
 /.rtk
 opencode.json
 
 # binaries
-/api
-/stream-process
-/migrate
+/packages/backend/api
+/packages/backend/stream-process
+/packages/backend/migrate

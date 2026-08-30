@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0001 — Why You Must Not Drop the Replication Slot on Shutdown</title>
+<link rel="stylesheet" href="../assets/lesson.css">
+</head>
+<body>
+
+<header>
+  <div class="lesson-kicker">Lesson 0001 · PostgreSQL CDC · trail-replay</div>
+  <h1>Why You Must Not Drop the Replication Slot on Shutdown</h1>
+  <div class="lesson-meta">
+    Mission: understand one TODO item deeply enough to defend it in a review · ~10 min ·
+    Source file under study: <code>cmd/stream-process/postgres_stream_process.go</code>
+  </div>
+</header>
+
+<div class="key-answer">
+  <p><strong>The one-sentence answer.</strong>
+  Your <code>wal_checkpoint</code> row is only a <em>client-side note</em> of where you stopped;
+  the replication slot is the <em>server-side mechanism</em> that makes PostgreSQL keep the WAL
+  for that position. Drop the slot and your checkpoint becomes a bookmark pointing at pages
+  Postgres is free to throw away &mdash; and any transaction committed while you were down is
+  skipped <em>permanently</em>.</p>
+</div>
+
+<h2>1. There are two bookmarks, not one</h2>
+
+<p>Your streamer tracks its position twice, and it&rsquo;s easy to mistake one for the other:</p>
+
+<table>
+  <tr><th></th><th>Client-side checkpoint</th><th>Replication slot</th></tr>
+  <tr>
+    <td><strong>Where</strong></td>
+    <td><code>wal_checkpoint</code> table (your DB row)</td>
+    <td>Server-side object, visible in <code>pg_replication_slots</code></td>
+  </tr>
+  <tr>
+    <td><strong>What it does</strong></td>
+    <td>Remembers the last LSN <em>you</em> persisted</td>
+    <td>Tells Postgres: <em>&ldquo;retain WAL from <code>restart_lsn</code> onward until I consume it&rdquo;</em></td>
+  </tr>
+  <tr>
+    <td><strong>Survives restart?</strong></td>
+    <td>Yes</td>
+    <td>Yes &mdash; <em>unless your code drops it</em></td>
+  </tr>
+</table>
+
+<p>The slot is not a connection detail. Gunnar Morling (founder of Debezium, the most
+widely-used Postgres CDC tool) defines slots as <em>&ldquo;Postgres&rsquo; mechanism for making sure
+that any segments of the write-ahead log (WAL) of the database are kept around until they have
+been processed by registered replication consumers&rdquo;</em>
+(<a href="https://www.morling.dev/blog/mastering-postgres-replication-slots/">Mastering Postgres Replication Slots</a>).
+Postgres replication slots <em>&ldquo;require active acknowledgement by the consumer in order to
+release processed WAL segments.&rdquo;</em> The slot is the retention anchor. The checkpoint row is just a note.</p>
+
+<h2>2. Walk the failure through your own code</h2>
+
+<p>Here is your shutdown path today:</p>
+
+<pre><code><span class="comment">// postgres_stream_process.go:842</span>
+func (ps *PostgresStreamer) cleanup() {
+	if ps.db != nil { ... }
+	if ps.conn != nil {
+		<span class="hl">ps.dropReplicationSlot()</span>   <span class="comment">// ← the problem, line 848</span>
+		ps.conn.Close(context.Background())
+	}
+}</code></pre>
+
+<p>Follow a deploy or restart, moment by moment:</p>
+
+<div class="timeline">
+  <div class="tl-event ok">
+    <span class="tl-lsn">t0 · running @ LSN 100</span>
+    Everything healthy. Checkpoint saved to <code>wal_checkpoint</code>. Slot retains WAL from 100 onward.
+  </div>
+  <div class="tl-event bad">
+    <span class="tl-lsn">t1 · SIGTERM (deploy, crash restart, config change)</span>
+    <code>cleanup()</code> calls <code>pg_drop_replication_slot()</code> (line 261).
+    <strong>Postgres is released from its obligation to keep WAL for you.</strong>
+    Segments older than anyone else&rsquo;s need may now be recycled.
+  </div>
+  <div class="tl-event lost">
+    <span class="tl-lsn">t2 · downtime · a transaction commits @ LSN 150</span>
+    Traffic continues against your app&rsquo;s tables. No slot is holding 100&ndash;200 for you.
+  </div>
+  <div class="tl-event bad">
+    <span class="tl-lsn">t3 · process restarts → createReplicationSlot() (line 129)</span>
+    A <em>fresh</em> slot is created. Per Postgres semantics, &ldquo;a consumer subscribing to this
+    slot will receive change events <strong>starting from this LSN</strong>&rdquo; (creation point, say LSN 200).
+    The new slot&rsquo;s world begins at 200. It cannot reach backward.
+  </div>
+  <div class="tl-event lost">
+    <span class="tl-lsn">t4 · startReplication() asks for your saved LSN 100 (line 284)</span>
+    <code>loadCheckpoint()</code> faithfully returns 100 &mdash; but the slot&rsquo;s confirmed position is 200.
+    Postgres cannot honor a start point that predates the slot&rsquo;s existence.
+    <strong>The change at 150 is never delivered. The stream resumes with a hole in it.</strong>
+  </div>
+</div>
+
+<p>The cruel part: <strong>nothing looks wrong.</strong> The process starts, replication flows,
+your logs look clean. But <code>wal_change</code> is silently missing every transaction from the
+downtime window &mdash; and for trail-replay, a change-history tool with holes in its history is
+a broken product. A crash would be kinder: loud failures get fixed; silent gaps get trusted.</p>
+
+<h2>3. The fair objection: &ldquo;aren&rsquo;t leftover slots dangerous?&rdquo;</h2>
+
+<p>Yes &mdash; and that&rsquo;s exactly why drop-on-shutdown is such a tempting habit. An
+<em>inactive</em> slot keeps pinning WAL: &ldquo;a replication slot could cause an unlimited amount
+of WAL backlog if a consumer stopped processing that slot, potentially exhausting the disk
+space of the database machine&rdquo; (Morling, same article). In dev, dropping on shutdown gives
+you a clean slate. In production, you&rsquo;ve traded a <em>visible, bounded, fixable</em> risk
+(disk usage, which you can monitor and cap) for an <em>invisible, unbounded, unfixable</em> one
+(lost history).</p>
+
+<p>The production answer is to <strong>keep the slot and bound the risk</strong>, not to drop it:</p>
+
+<div class="dodont">
+  <div class="do">
+    <h3>Do</h3>
+    <ul>
+      <li>Create the slot once, idempotently &mdash; your <code>&ldquo;already exists, continuing&hellip;&rdquo;</code> branch (line 137) is already correct</li>
+      <li>Leave the slot in place on shutdown; it holds your position server-side across restarts</li>
+      <li>Cap retention: <code>max_slot_wal_keep_size = 50GB</code> (PG 13+) &mdash; Postgres invalidates an over-lagging slot rather than eating the disk (TODO L85)</li>
+      <li>Monitor <code>pg_replication_slots</code>: status, retained WAL, safe headroom &mdash; alert before pain (TODO L91)</li>
+    </ul>
+  </div>
+  <div class="dont">
+    <h3>Don&rsquo;t</h3>
+    <ul>
+      <li>Drop the slot in <code>cleanup()</code> or any shutdown/signal path</li>
+      <li>Drop on reconnect after a network blip &mdash; transient errors are why the slot exists</li>
+      <li>Treat the <code>wal_checkpoint</code> row as sufficient &mdash; without the slot, nothing guarantees that LSN is still readable</li>
+    </ul>
+  </div>
+</div>
+
+<p>There is exactly one right time to drop a slot: <strong>deliberate decommissioning</strong> &mdash;
+when the consumer is being retired for good. Morling&rsquo;s housekeeping rule is to remember to drop
+<em>unused</em> slots, via an explicit admin action: <code>SELECT pg_drop_replication_slot('...')</code> &mdash;
+run by a human (or an admin command), never by a signal handler.</p>
+
+<h2>4. Test yourself</h2>
+
+<div class="quiz">
+  <div class="quiz-q">
+    <p class="quiz-prompt">1 · The streamer shuts down, <code>cleanup()</code> drops the slot, and a transaction commits before the process restarts. What happens to that transaction&rsquo;s change events?</p>
+    <ul class="quiz-options">
+      <li data-correct="false">They replay from the saved client-side checkpoint LSN</li>
+      <li data-correct="false">They wait inside the publication until reconnecting later</li>
+      <li data-correct="true">They never appear in the new slot&rsquo;s stream</li>
+      <li data-correct="false">They get re-emitted once the new slot starts</li>
+    </ul>
+    <p class="quiz-explain" hidden>The checkpoint is only a note; the recreated slot starts at its creation LSN and cannot reach backward. The downtime transaction falls into the gap between the old slot&rsquo;s last position and the new slot&rsquo;s birth.</p>
+  </div>
+
+  <div class="quiz-q">
+    <p class="quiz-prompt">2 · Dropping the slot makes replay from your saved checkpoint impossible because&hellip;</p>
+    <ul class="quiz-options">
+      <li data-correct="false">the checkpoint table is dropped alongside the slot</li>
+      <li data-correct="true">Postgres stops retaining WAL beyond the slot&rsquo;s position</li>
+      <li data-correct="false">the publication forgets which tables it should publish</li>
+      <li data-correct="false">the pgoutput plugin gets uninstalled when slot drops</li>
+    </ul>
+    <p class="quiz-explain" hidden>The slot is the retention anchor. Once dropped, WAL older than other consumers&rsquo; needs may be recycled, and a new slot only sees changes from its creation point onward.</p>
+  </div>
+
+  <div class="quiz-q">
+    <p class="quiz-prompt">3 · If dropping on shutdown is wrong, why does it <em>feel</em> responsible? What is the real risk of leaving a slot in place?</p>
+    <ul class="quiz-options">
+      <li data-correct="true">An inactive slot retains WAL, potentially filling disk</li>
+      <li data-correct="false">Each idle slot consumes a full backend connection</li>
+      <li data-correct="false">Old slots gradually degrade the server&rsquo;s decoding performance</li>
+      <li data-correct="false">Inactive slots block autovacuum while they remain alive</li>
+    </ul>
+    <p class="quiz-explain" hidden>Unbounded WAL retention from a stopped consumer is the classic slot failure. The fix is a bound (<code>max_slot_wal_keep_size</code>) plus monitoring &mdash; not dropping the slot on every shutdown.</p>
+  </div>
+
+  <div class="quiz-q">
+    <p class="quiz-prompt">4 · When <em>should</em> a replication slot be dropped?</p>
+    <ul class="quiz-options">
+      <li data-correct="false">During every single graceful shutdown of the consumer</li>
+      <li data-correct="false">Automatically right after each successful client-side checkpoint write</li>
+      <li data-correct="false">Whenever the consumer reconnects following a network failure</li>
+      <li data-correct="true">As an explicit, deliberate admin action during decommissioning</li>
+    </ul>
+    <p class="quiz-explain" hidden>Dropping is a destructive, position-erasing act. It belongs behind an explicit admin command (e.g. a <code>--drop-slot</code> flag or SQL run by a human) when the consumer is retired &mdash; never in a signal handler.</p>
+  </div>
+</div>
+
+<h2>5. Prove it on your own database (5 minutes)</h2>
+
+<div class="exercise">
+  <h3>Watch a change vanish</h3>
+  <p>Uses the <code>test_decoding</code> plugin (text output, no publication needed) against your
+  dockerized Postgres. Start it with <code>docker compose up -d postgres</code>, then connect:
+  <code>PGPASSWORD=trailpass psql -h localhost -p 5433 -U trailuser -d traildb</code></p>
+
+<pre><code><span class="comment">-- 1. Create a demo slot</span>
+SELECT pg_create_logical_replication_slot('demo_slot', 'test_decoding');
+
+<span class="comment">-- 2. Commit change #1, then consume it (advances the slot)</span>
+CREATE TABLE slot_demo (id int);
+INSERT INTO slot_demo VALUES (1);
+SELECT * FROM pg_logical_slot_get_changes('demo_slot', NULL, NULL);
+<span class="comment">-- → you see the INSERT of 1. Slot is now positioned after it.</span>
+
+<span class="comment">-- 3. "Downtime" begins. A change commits while you're down.</span>
+INSERT INTO slot_demo VALUES (2);
+
+<span class="comment">-- 4. THE MISTAKE: your cleanup() drops the slot on shutdown</span>
+SELECT pg_drop_replication_slot('demo_slot');
+
+<span class="comment">-- 5. More downtime traffic, no slot retaining anything</span>
+INSERT INTO slot_demo VALUES (3);
+
+<span class="comment">-- 6. "Restart": recreate the slot</span>
+SELECT pg_create_logical_replication_slot('demo_slot', 'test_decoding');
+
+<span class="comment">-- 7. New traffic after restart</span>
+INSERT INTO slot_demo VALUES (4);
+
+<span class="comment">-- 8. Consume: what do you get?</span>
+SELECT * FROM pg_logical_slot_get_changes('demo_slot', NULL, NULL);
+<span class="comment">-- → ONLY the INSERT of 4. Rows 2 and 3 are gone from the stream
+<span class="comment">--   forever — yet they sit happily in the table. That is the silent hole.</span></span>
+
+<span class="comment">-- 9. Contrast (optional): repeat steps 1–3 but SKIP the drop.
+<span class="comment">--    get_changes now returns row 2. The slot held it for you.</span></span>
+
+<span class="comment">-- 10. Clean up</span>
+SELECT pg_drop_replication_slot('demo_slot');
+DROP TABLE slot_demo;</code></pre>
+
+  <p>Contrast step 9 is the whole lesson in one query: the only difference between
+  &ldquo;row 2 survives a restart&rdquo; and &ldquo;row 2 vanishes&rdquo; is whether the slot was dropped.</p>
+</div>
+
+<h2>6. What this means for your TODO</h2>
+
+<ul>
+  <li><strong>TODO L7 / L26</strong> &mdash; remove <code>ps.dropReplicationSlot()</code> from <code>cleanup()</code>. Slot creation is already idempotent (line 137), so restarts will re-attach to the existing slot and resume from its position.</li>
+  <li>Add an explicit admin path for dropping (a flag/subcommand), used only when decommissioning.</li>
+  <li><strong>TODO L85</strong> &mdash; set <code>max_slot_wal_keep_size</code> so a long-dead consumer invalidates the slot instead of filling the disk.</li>
+  <li><strong>TODO L91</strong> &mdash; alert on <code>pg_replication_slots</code>: inactive &gt; 30 min, retained WAL &gt; threshold. This is what makes keeping the slot <em>safe</em>.</li>
+</ul>
+
+<h2>Further reading</h2>
+<ul>
+  <li><strong>Primary source:</strong> <a href="https://www.morling.dev/blog/mastering-postgres-replication-slots/">Mastering Postgres Replication Slots</a> — Gunnar Morling. Read §&ldquo;Define a Maximum Replication Slot Size&rdquo; and §&ldquo;Drop Unused Replication Slots&rdquo; with this lesson in mind.</li>
+  <li><a href="https://www.postgresql.org/docs/current/view-pg-replication-slots.html">PostgreSQL docs: <code>pg_replication_slots</code></a> — the view that shows your slot&rsquo;s position and retained WAL.</li>
+  <li><a href="https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-REPLICATION">PostgreSQL docs: replication functions</a> — <code>pg_create_logical_replication_slot</code>, <code>pg_drop_replication_slot</code>.</li>
+  <li>Companion reference in this workspace: <a href="../reference/replication-slot-cheatsheet.html">Replication Slot Cheat Sheet</a>.</li>
+</ul>
+
+<div class="ask-note">
+  Questions are part of the lesson. If anything above is unclear &mdash; e.g. what
+  <code>confirmed_flush_lsn</code> vs <code>restart_lsn</code> mean, or how your
+  <code>ON CONFLICT DO NOTHING</code> dedup interacts with stale checkpoints &mdash; ask and we&rsquo;ll dig in.
+</div>
+
+<footer class="lesson-footer">
+  Lesson 0001 · trail-replay learning workspace ·
+  Reference: <a href="../reference/replication-slot-cheatsheet.html">replication slot cheat sheet</a>
+</footer>
+
+<script src="../assets/quiz.js"></script>
+</body>
+</html>

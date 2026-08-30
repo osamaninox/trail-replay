@@ -7,34 +7,41 @@ This project follows **Hexagonal Architecture** (Ports & Adapters), keeping busi
 ## Directory Structure
 
 ```
-trail-replay/
-├── cmd/
-│   └── api/
-│       └── main.go                          # Entry point — wires everything together
-│
-├── internal/
-│   ├── core/                                # Business logic — no infra dependencies
-│   │   ├── domain/
-│   │   │   └── trail.go                     # Pure domain entities (Trail, Event)
-│   │   ├── ports/
-│   │   │   ├── inbound/
-│   │   │   │   └── trail_service.go         # Driving port — interface the app exposes
-│   │   │   └── outbound/
-│   │   │       └── trail_repository.go      # Driven port — interface the core needs
-│   │   └── services/
-│   │       └── trail_service.go             # Business logic, depends only on ports
+trail-replay/                                  # npm workspaces monorepo
+├── packages/
+│   ├── backend/                               # Go module (module name: trail-replay)
+│   │   ├── cmd/
+│   │   │   └── api/
+│   │   │       └── main.go                    # Entry point — wires everything together
+│   │   │
+│   │   ├── internal/
+│   │   │   ├── core/                          # Business logic — no infra dependencies
+│   │   │   │   ├── domain/
+│   │   │   │   │   └── trail.go               # Pure domain entities (Trail, Event)
+│   │   │   │   ├── ports/
+│   │   │   │   │   ├── inbound/
+│   │   │   │   │   │   └── trail_service.go   # Driving port — interface the app exposes
+│   │   │   │   │   └── outbound/
+│   │   │   │   │       └── trail_repository.go # Driven port — interface the core needs
+│   │   │   │   └── services/
+│   │   │   │       └── trail_service.go       # Business logic, depends only on ports
+│   │   │   │
+│   │   │   └── adapters/                      # Infra implementations of ports
+│   │   │       ├── inbound/
+│   │   │       │   └── http/
+│   │   │       │       └── handler.go         # HTTP driving adapter (Go 1.22 routing)
+│   │   │       └── outbound/
+│   │   │           └── storage/
+│   │   │               └── memory_repository.go # In-memory driven adapter
+│   │   │
+│   │   └── pkg/
+│   │       └── config/
+│   │           └── config.go                  # Shared config (env-based)
 │   │
-│   └── adapters/                            # Infra implementations of ports
-│       ├── inbound/
-│       │   └── http/
-│       │       └── handler.go               # HTTP driving adapter (Go 1.22 routing)
-│       └── outbound/
-│           └── storage/
-│               └── memory_repository.go     # In-memory driven adapter
+│   └── frontend/                              # React + Vite app (in development)
 │
-└── pkg/
-    └── config/
-        └── config.go                        # Shared config (env-based)
+├── Makefile                                   # Root targets cd into packages/backend
+└── docker-compose.yml                         # Backend build context: ./packages/backend
 ```
 
 ---
