@@ -6,9 +6,12 @@ import (
 )
 
 type Config struct {
-	HTTPAddr    string
-	Database    DatabaseConfig
-	WalDatabase DatabaseConfig
+	HTTPAddr      string
+	Database      DatabaseConfig
+	WalDatabase   DatabaseConfig
+	JWTSecret     string
+	EncryptionKey string
+	CORSOrigin    string
 }
 
 type DatabaseConfig struct {
@@ -43,7 +46,10 @@ func Load() Config {
 	dbSSLMode := getEnvOrDefault("DB_SSLMODE", "disable")
 
 	return Config{
-		HTTPAddr: addr,
+		HTTPAddr:      addr,
+		JWTSecret:     getEnvOrDefault("JWT_SECRET", "trail-replay-dev-secret"),
+		EncryptionKey: getEnvOrDefault("DB_ENCRYPTION_KEY", "trail-replay-dev-encryption-key"),
+		CORSOrigin:    getEnvOrDefault("CORS_ORIGIN", "http://localhost:5173"),
 		Database: DatabaseConfig{
 			Host:     dbHost,
 			Port:     dbPort,

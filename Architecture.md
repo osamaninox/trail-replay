@@ -11,34 +11,28 @@ trail-replay/                                  # npm workspaces monorepo
 ├── packages/
 │   ├── backend/                               # Go module (module name: trail-replay)
 │   │   ├── cmd/
-│   │   │   └── api/
-│   │   │       └── main.go                    # Entry point — wires everything together
+│   │   │   ├── api/main.go                    # API entry point — wires everything together
+│   │   │   ├── migrate/main.go                # goose migrations (-wal for the WAL database)
+│   │   │   └── stream-process/                # WAL logical-replication streamer
 │   │   │
 │   │   ├── internal/
-│   │   │   ├── core/                          # Business logic — no infra dependencies
-│   │   │   │   ├── domain/
-│   │   │   │   │   └── trail.go               # Pure domain entities (Trail, Event)
+│   │   │   ├── core/trail/                    # Business logic — no infra dependencies
+│   │   │   │   ├── domain/                    # Pure entities: wal, revert, user, source_database
 │   │   │   │   ├── ports/
-│   │   │   │   │   ├── inbound/
-│   │   │   │   │   │   └── trail_service.go   # Driving port — interface the app exposes
-│   │   │   │   │   └── outbound/
-│   │   │   │   │       └── trail_repository.go # Driven port — interface the core needs
-│   │   │   │   └── services/
-│   │   │   │       └── trail_service.go       # Business logic, depends only on ports
+│   │   │   │   │   ├── inbound/               # Driving ports (auth, wal, revert, source_db services)
+│   │   │   │   │   └── outbound/              # Driven ports (repositories, source_db executor)
+│   │   │   │   └── services/                  # Business logic, depends only on ports
 │   │   │   │
 │   │   │   └── adapters/                      # Infra implementations of ports
 │   │   │       ├── inbound/
-│   │   │       │   └── http/
-│   │   │       │       └── handler.go         # HTTP driving adapter (Go 1.22 routing)
+│   │   │       │   └── http/                  # handlers (wal, revert, auth, database) + JWT/CORS middleware
 │   │   │       └── outbound/
-│   │   │           └── storage/
-│   │   │               └── memory_repository.go # In-memory driven adapter
+│   │   │           └── storage/               # postgres/ repositories + in-memory user/source-db repos
 │   │   │
-│   │   └── pkg/
-│   │       └── config/
-│   │           └── config.go                  # Shared config (env-based)
+│   │   ├── pkg/                               # config, crypto (AES-GCM), database helpers
+│   │   └── migrations/                        # goose SQL migrations
 │   │
-│   └── frontend/                              # React + Vite app (in development)
+│   └── frontend/                              # React + Vite SPA (HeroUI, React Router)
 │
 ├── Makefile                                   # Root targets cd into packages/backend
 └── docker-compose.yml                         # Backend build context: ./packages/backend
@@ -53,8 +47,8 @@ trail-replay/                                  # npm workspaces monorepo
          │                  CORE                   │
          │                                         │
  HTTP ──►│  inbound port        outbound port      │──► Storage
- CLI ───►│  (TrailService)  →   (TrailRepository)  │──► External API
- gRPC ──►│                                         │──► Message Queue
+ CLI ───►│ (WalQueryService) → (WalQueryRepository)│──► External API
+ gRPC ──►│ (RevertService)    (RevertRepository)   │──► Message Queue
          │         domain / services               │
          └─────────────────────────────────────────┘
            ▲ driving adapters       driven adapters ▲
@@ -68,9 +62,9 @@ trail-replay/                                  # npm workspaces monorepo
 | Decision | Rationale |
 |---|---|
 | `core/` has zero knowledge of adapters | Imports only `domain` and its own `ports` — never adapter packages |
-| `NewTrailService` returns `inbound.TrailService` | Callers always program-to-interface, never to the concrete struct |
-| Swap storage with one line | Implement `outbound.TrailRepository`, update the wire-up in `main.go` |
-| Tests use real in-memory adapter | No mocks needed — adapters are cheap; avoids mock/prod divergence |
+| Constructors return port interfaces | e.g. `NewAuthService` returns `inbound.AuthService` — callers program-to-interface |
+| Swap storage with one line | Implement the outbound port, update the wire-up in `main.go` |
+| Tests use real in-memory adapters | No mocks needed — adapters are cheap; avoids mock/prod divergence |
 
 ---
 

@@ -6,6 +6,8 @@
     "api": "go run ./cmd/api",
     "stream": "go run ./cmd/stream-process",
     "migrate": "go run ./cmd/migrate",
+    "migrate:up": "go run ./cmd/migrate",
+    "migrate:up:wal": "go run ./cmd/migrate -wal",
     "test": "go test ./...",
     "test:unit": "go test -short ./..."
   }

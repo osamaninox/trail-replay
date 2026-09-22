@@ -7,40 +7,7 @@ import (
 	"time"
 
 	"github.com/lib/pq"
-	"trail-replay/internal/core/trail/domain"
 )
-
-// DomainEntity represents any entity that can be converted to/from domain models
-type DomainEntity[T any] interface {
-	ToDomain() T
-}
-
-// EntityConverter provides generic conversion methods
-type EntityConverter[E DomainEntity[T], T any] struct{}
-
-func (c EntityConverter[E, T]) ToDomainSlice(entities []E) []T {
-	result := make([]T, len(entities))
-	for i, entity := range entities {
-		result[i] = entity.ToDomain()
-	}
-	return result
-}
-
-type TrailEntity struct {
-	ID        string    `db:"id"`
-	Name      string    `db:"name"`
-	CreatedAt time.Time `db:"created_at"`
-	UpdatedAt time.Time `db:"updated_at"`
-}
-
-type EventEntity struct {
-	ID        string      `db:"id"`
-	TrailID   string      `db:"trail_id"`
-	Type      string      `db:"type"`
-	Payload   PayloadJSON `db:"payload"`
-	OccuredAt time.Time   `db:"occured_at"`
-	Sequence  int64       `db:"sequence"`
-}
 
 type PayloadJSON map[string]any
 
@@ -68,47 +35,6 @@ func (p *PayloadJSON) Scan(value any) error {
 	}
 
 	return json.Unmarshal(bytes, p)
-}
-
-func (e *TrailEntity) ToDomain() *domain.Trail {
-	return &domain.Trail{
-		ID:        e.ID,
-		Name:      e.Name,
-		Events:    []domain.Event{}, // Will be loaded separately
-		CreatedAt: e.CreatedAt,
-		UpdatedAt: e.UpdatedAt,
-	}
-}
-
-func (e *EventEntity) ToDomain() domain.Event {
-	return domain.Event{
-		ID:        e.ID,
-		TrailID:   e.TrailID,
-		Type:      domain.EventType(e.Type),
-		Payload:   map[string]any(e.Payload),
-		OccuredAt: e.OccuredAt,
-		Sequence:  e.Sequence,
-	}
-}
-
-func TrailToEntity(t *domain.Trail) *TrailEntity {
-	return &TrailEntity{
-		ID:        t.ID,
-		Name:      t.Name,
-		CreatedAt: t.CreatedAt,
-		UpdatedAt: t.UpdatedAt,
-	}
-}
-
-func EventToEntity(e *domain.Event) *EventEntity {
-	return &EventEntity{
-		ID:        e.ID,
-		TrailID:   e.TrailID,
-		Type:      string(e.Type),
-		Payload:   PayloadJSON(e.Payload),
-		OccuredAt: e.OccuredAt,
-		Sequence:  e.Sequence,
-	}
 }
 
 // WalTransactionEntity maps to the wal_transaction table for CDC log persistence.

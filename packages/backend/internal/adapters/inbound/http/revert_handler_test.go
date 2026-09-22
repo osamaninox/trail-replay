@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,16 @@ import (
 	"trail-replay/internal/core/trail/domain"
 	"trail-replay/internal/core/trail/services"
 )
+
+func skipShortCI(t *testing.T) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	if os.Getenv("CI") != "" && os.Getenv("SKIP_INTEGRATION") != "" {
+		t.Skip("skipping integration test in CI")
+	}
+}
 
 func startPGWithRevert(ctx context.Context, t *testing.T) (*tcpostgres.PostgresContainer, *sqlx.DB) {
 	t.Helper()

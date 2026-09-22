@@ -1,0 +1,14 @@
+{
+  "name": "trail-replay",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "client": "npm run dev -w packages/frontend",
+    "build": "npm run build -w packages/frontend",
+    "api": "npm run api -w packages/backend",
+    "migrate": "npm run migrate:up:wal -w packages/backend",
+    "test:backend": "npm run test -w packages/backend"
+  }
+}
