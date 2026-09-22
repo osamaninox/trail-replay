@@ -9,6 +9,10 @@
     "build": "npm run build -w packages/frontend",
     "api": "npm run api -w packages/backend",
     "migrate": "npm run migrate:up:wal -w packages/backend",
-    "test:backend": "npm run test -w packages/backend"
+    "test:backend": "npm run test -w packages/backend",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
   }
 }

@@ -8,3 +8,8 @@ opencode.json
 /packages/backend/api
 /packages/backend/stream-process
 /packages/backend/migrate
+
+
+# dist
+/packages/**/dist/
+/packages/frontend/node_modules/

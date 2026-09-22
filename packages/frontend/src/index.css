@@ -1,0 +1,8 @@
+@import 'tailwindcss';
+
+@plugin './hero.ts';
+
+/* npm workspaces hoist dependencies to the repo root node_modules */
+@source '../../../node_modules/@heroui/theme/dist/**/*.{js,ts,jsx,tsx}';
+
+@custom-variant dark (&:is(.dark *));
