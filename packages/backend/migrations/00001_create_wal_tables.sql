@@ -24,7 +24,7 @@ CREATE TABLE wal_transaction (
 
 CREATE TABLE wal_change (
     id                    bigserial primary key,
-    transaction_id        bigint not null references wal_transaction(id) on delete cascade,
+    transaction_id        bigint not null
     change_seq_in_txn     integer not null,
     change_lsn            pg_lsn,
     tenant_id             text,
