@@ -14,16 +14,5 @@ CREATE TABLE revert_job (
     completed_at    timestamptz
 );
 
-CREATE TABLE revert_job_change (
-    job_id        uuid not null references revert_job(id) on delete cascade,
-    change_id     bigint not null references wal_change(id),
-    status        text not null default 'pending'
-                  check (status in ('pending','applied','failed','skipped')),
-    error_message text,
-    applied_at    timestamptz,
-    primary key (job_id, change_id)
-);
-
 -- +goose Down
-DROP TABLE IF EXISTS revert_job_change;
 DROP TABLE IF EXISTS revert_job;
