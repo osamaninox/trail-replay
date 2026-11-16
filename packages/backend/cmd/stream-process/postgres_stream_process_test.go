@@ -392,6 +392,23 @@ func TestGenerateInsertSQL_NullsAndSpecialChars(t *testing.T) {
 	}
 }
 
+// --- generateReverseInsertSQL ---
+
+func TestGenerateReverseInsertSQL_NilRow(t *testing.T) {
+	if got := generateReverseInsertSQL("public", "trails", nil); got != "" {
+		t.Errorf("expected empty, got %q", got)
+	}
+}
+
+func TestGenerateReverseInsertSQL_OnConflict(t *testing.T) {
+	row := postgres.PayloadJSON{"id": "t1"}
+	got := generateReverseInsertSQL("public", "trails", &row)
+	want := `INSERT INTO "public"."trails" ("id") VALUES ('t1') ON CONFLICT DO NOTHING`
+	if got != want {
+		t.Errorf("expected %q, got %q", want, got)
+	}
+}
+
 // --- generateDeleteSQL ---
 
 func TestGenerateDeleteSQL_NilRow(t *testing.T) {

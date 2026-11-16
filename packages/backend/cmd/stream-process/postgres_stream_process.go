@@ -581,7 +581,7 @@ func (ps *PostgresStreamer) parseLogicalMessage(data []byte) {
 			pkCols := ps.getRelationPK(rel)
 			oldRow := tupleToRow(rel, m.OldTuple)
 			forwardDML := generateDeleteSQL(rel.Namespace, rel.RelationName, pkCols, oldRow)
-			reverseDML := generateInsertSQL(rel.Namespace, rel.RelationName, oldRow)
+			reverseDML := generateReverseInsertSQL(rel.Namespace, rel.RelationName, oldRow)
 
 			ps.currentTxn.changes = append(ps.currentTxn.changes, postgres.WalChangeEntity{
 				ChangeSeqInTxn: int32(len(ps.currentTxn.changes) + 1),
@@ -897,6 +897,18 @@ func generateInsertSQL(schema, table string, row *postgres.PayloadJSON) string {
 		pgQuoteIdent(schema), pgQuoteIdent(table),
 		strings.Join(cols, ", "),
 		strings.Join(vals, ", "))
+}
+
+// generateReverseInsertSQL renders the reverse of a DELETE. ON CONFLICT DO
+// NOTHING (no target: PK or any unique violation) makes replay after a
+// committed source transaction a no-op — the row is already back. This is
+// what makes the source-commit/WAL-mark crash window safe (plan §5).
+func generateReverseInsertSQL(schema, table string, row *postgres.PayloadJSON) string {
+	sql := generateInsertSQL(schema, table, row)
+	if sql == "" {
+		return ""
+	}
+	return sql + " ON CONFLICT DO NOTHING"
 }
 
 func generateDeleteSQL(schema, table string, pkCols []string, row *postgres.PayloadJSON) string {
