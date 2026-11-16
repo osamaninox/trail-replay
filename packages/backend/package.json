@@ -4,6 +4,7 @@
   "version": "0.0.0",
   "scripts": {
     "api": "go run ./cmd/api",
+    "mcp": "go run ./cmd/mcp-server",
     "stream": "go run ./cmd/stream-process",
     "migrate": "go run ./cmd/migrate",
     "migrate:up": "go run ./cmd/migrate",
