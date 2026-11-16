@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"testing"
@@ -9,7 +10,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
+	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -65,105 +67,68 @@ func startPGWithRevertTables(ctx context.Context, t *testing.T) (*tcpostgres.Pos
 	return pgContainer, db
 }
 
+// runRevertMigrations applies the real goose migrations so tests always run
+// against the shipped schema (go test runs with cwd = package dir).
 func runRevertMigrations(db *sqlx.DB) error {
-	statements := []string{
-		`CREATE TABLE wal_transaction (
-			id                bigserial primary key,
-			source_slot       text not null,
-			source_db         text not null,
-			xid               bigint not null,
-			begin_lsn         pg_lsn,
-			commit_lsn        pg_lsn not null,
-			end_lsn           pg_lsn,
-			commit_ts         timestamptz not null,
-			origin_name       text,
-			tenant_id         text,
-			change_count      integer not null default 0,
-			forward_sql_text  text,
-			reverse_sql_text  text,
-			forward_sql_hash  bytea,
-			reverse_sql_hash  bytea,
-			safety_flags      text[] not null default '{}',
-			ingest_batch_id   uuid,
-			ingested_at       timestamptz not null default now(),
-			unique (source_slot, commit_lsn),
-			unique (source_slot, xid, commit_lsn)
-		)`,
-		`CREATE TABLE wal_change (
-			id                    bigserial primary key,
-			transaction_id        bigint not null references wal_transaction(id) on delete cascade,
-			change_seq_in_txn     integer not null,
-			change_lsn            pg_lsn,
-			tenant_id             text,
-			schema_name           text not null,
-			table_name            text not null,
-			table_oid             oid,
-			op                    char(1) not null check (op in ('I','U','D')),
-			replica_identity_mode text,
-			row_pk                jsonb,
-			old_row               jsonb,
-			new_row               jsonb,
-			changed_columns       text[] not null default '{}',
-			forward_dml_sql       text not null,
-			reverse_dml_sql       text not null,
-			forward_sql_hash      bytea,
-			reverse_sql_hash      bytea,
-			reverse_where_sql     text,
-			affected_row_count    integer not null default 1,
-			undo_status           text not null default 'not_applied',
-			undo_applied_at       timestamptz,
-			undo_applied_by       text,
-			safety_flags          text[] not null default '{}',
-			created_at            timestamptz not null default now(),
-			unique (transaction_id, change_seq_in_txn)
-		)`,
-		`CREATE TABLE revert_job (
-			id              uuid primary key,
-			status          text not null default 'pending',
-			input_from      timestamptz not null,
-			input_to        timestamptz not null,
-			total_changes   int not null default 0,
-			completed_count int not null default 0,
-			failed_count    int not null default 0,
-			last_error      text,
-			created_at      timestamptz not null default now(),
-			updated_at      timestamptz not null default now(),
-			completed_at    timestamptz
-		)`,
-		`CREATE TABLE revert_job_change (
-			job_id        uuid references revert_job(id) on delete cascade,
-			change_id     bigint references wal_change(id),
-			status        text not null default 'pending',
-			error_message text,
-			applied_at    timestamptz,
-			primary key (job_id, change_id)
-		)`,
+	if err := goose.SetDialect("postgres"); err != nil {
+		return err
 	}
-	for _, s := range statements {
-		if _, err := db.Exec(s); err != nil {
-			return fmt.Errorf("migration error: %w\nSQL: %s", err, s)
-		}
-	}
-	return nil
+	return goose.Up(db.DB, "../../../../../migrations")
 }
 
-func insertTestTxn(db *sqlx.DB, id uint64, commitTS time.Time) error {
+func insertTestTxn(t *testing.T, db *sqlx.DB, id uint64, commitTS time.Time, changeCount int) {
+	t.Helper()
 	lsn := fmt.Sprintf("0/%X", id)
 	_, err := db.Exec(
 		`INSERT INTO wal_transaction (id, source_slot, source_db, xid, commit_lsn, commit_ts, change_count, ingested_at)
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
-		id, "test_slot", "testdb", int64(id*100), lsn, commitTS, 1, commitTS,
+		id, "test_slot", "testdb", int64(id*100), lsn, commitTS, changeCount, commitTS,
 	)
+	if err != nil {
+		t.Fatalf("insert txn %d: %v", id, err)
+	}
+}
+
+func insertTestChange(t *testing.T, db *sqlx.DB, id, txnID uint64, seq int32, tableName, op, reverseSQL string) {
+	t.Helper()
+	_, err := db.Exec(
+		`INSERT INTO wal_change (id, transaction_id, change_seq_in_txn, schema_name, table_name, op, forward_dml_sql, reverse_dml_sql)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		id, txnID, seq, "public", tableName, op, reverseSQL, reverseSQL,
+	)
+	if err != nil {
+		t.Fatalf("insert change %d: %v", id, err)
+	}
+}
+
+func createTestJob(t *testing.T, repo outbound.RevertRepository) *domain.RevertJob {
+	t.Helper()
+	ctx := context.Background()
+	from := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
+	to := time.Now().UTC().Truncate(time.Microsecond)
+	job := domain.NewRevertJob(from, to)
+	if err := repo.CreateJob(ctx, job); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	return job
+}
+
+// testSQLTx wraps a driver transaction so mark methods can join a
+// caller-managed transaction, as the DBOS durable-transaction step does.
+type testSQLTx struct{ tx *sqlx.Tx }
+
+func (t testSQLTx) Exec(ctx context.Context, query string, args ...any) error {
+	_, err := t.tx.ExecContext(ctx, query, args...)
 	return err
 }
 
-func insertTestChange(db *sqlx.DB, id uint64, txnID uint64, seq int32, tableName, op, reverseSQL, undoStatus string) error {
-	_, err := db.Exec(
-		`INSERT INTO wal_change (id, transaction_id, change_seq_in_txn, schema_name, table_name, op, forward_dml_sql, reverse_dml_sql, undo_status)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		id, txnID, seq, "public", tableName, op, reverseSQL, reverseSQL, undoStatus,
-	)
-	return err
+func beginTestTx(ctx context.Context, t *testing.T, db *sqlx.DB) (outbound.SQLTx, *sqlx.Tx) {
+	t.Helper()
+	tx, err := db.BeginTxx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	return testSQLTx{tx}, tx
 }
 
 func TestCreateAndGetJob(t *testing.T) {
@@ -302,79 +267,6 @@ func TestCountJobs(t *testing.T) {
 	}
 }
 
-func TestGetNextPendingJob(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	from := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
-	to := time.Now().UTC().Truncate(time.Microsecond)
-
-	job1 := domain.NewRevertJob(from, to)
-	repo.CreateJob(ctx, job1)
-
-	time.Sleep(time.Millisecond)
-	job2 := domain.NewRevertJob(from, to)
-	repo.CreateJob(ctx, job2)
-
-	next, err := repo.GetNextPendingJob(ctx)
-	if err != nil {
-		t.Fatalf("get next pending: %v", err)
-	}
-	if next == nil {
-		t.Fatal("expected a pending job")
-	}
-	if next.ID != job1.ID {
-		t.Errorf("expected oldest pending (%s), got %s", job1.ID, next.ID)
-	}
-}
-
-func TestGetNextPendingJob_None(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	next, err := repo.GetNextPendingJob(ctx)
-	if err != nil {
-		t.Fatalf("get next pending: %v", err)
-	}
-	if next != nil {
-		t.Error("expected nil when no pending jobs")
-	}
-}
-
-func TestGetActiveJob(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	from := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
-	to := time.Now().UTC().Truncate(time.Microsecond)
-	job := domain.NewRevertJob(from, to)
-	job.Status = domain.RevertJobStatusInProgress
-	repo.CreateJob(ctx, job)
-
-	active, err := repo.GetActiveJob(ctx)
-	if err != nil {
-		t.Fatalf("get active: %v", err)
-	}
-	if active == nil {
-		t.Fatal("expected active job")
-	}
-	if active.ID != job.ID {
-		t.Errorf("id mismatch")
-	}
-}
-
 func TestUpdateJob(t *testing.T) {
 	ctx := context.Background()
 	pgContainer, db := startPGWithRevertTables(ctx, t)
@@ -403,7 +295,7 @@ func TestUpdateJob(t *testing.T) {
 	}
 }
 
-func TestCountUnappliedChanges(t *testing.T) {
+func TestCountRevertableTransactions(t *testing.T) {
 	ctx := context.Background()
 	pgContainer, db := startPGWithRevertTables(ctx, t)
 	defer func() { pgContainer.Terminate(ctx) }()
@@ -412,28 +304,81 @@ func TestCountUnappliedChanges(t *testing.T) {
 	repo := postgres.NewRevertRepository(db)
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	insertTestTxn(db, 1, now.Add(-30*time.Minute))
-	insertTestTxn(db, 2, now.Add(-20*time.Minute))
-	insertTestTxn(db, 3, now.Add(-5*time.Minute))
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 1)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 1)
+	insertTestTxn(t, db, 3, now.Add(-5*time.Minute), 1)
+	insertTestTxn(t, db, 4, now.Add(1*time.Hour), 1) // outside window
 
-	insertTestChange(db, 1, 1, 1, "users", "U", "UPDATE users SET email='old' WHERE id=1", "not_applied")
-	insertTestChange(db, 2, 2, 1, "orders", "I", "DELETE FROM orders WHERE id=1", "not_applied")
-	insertTestChange(db, 3, 2, 2, "orders", "D", "INSERT INTO orders (id) VALUES (1)", "applied")
-	insertTestChange(db, 4, 3, 1, "users", "U", "UPDATE users SET email='old2' WHERE id=2", "not_applied")
-
-	from := now.Add(-1 * time.Hour)
-	to := now
-
-	count, err := repo.CountUnappliedChanges(ctx, from, to)
+	// Txn 2 already reverted by another job → excluded by the anti-join.
+	otherJob := createTestJob(t, repo)
+	_, err := db.Exec(
+		`INSERT INTO revert_job_transaction (job_id, seq, transaction_id, commit_lsn, change_count, status)
+		 VALUES ($1, 1, 2, '0/2', 1, 'applied')`, otherJob.ID)
 	if err != nil {
-		t.Fatalf("count: %v", err)
+		t.Fatalf("insert applied txn: %v", err)
+	}
+
+	count, err := repo.CountRevertableTransactions(ctx, now.Add(-1*time.Hour), now)
+	if err != nil {
+		t.Fatalf("count revertable: %v", err)
+	}
+	if count != 2 {
+		t.Errorf("expected 2 revertable transactions (1,3), got %d", count)
+	}
+}
+
+func TestSnapshotPlan(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 2)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 3)
+	insertTestTxn(t, db, 3, now.Add(-5*time.Minute), 5)
+
+	job := createTestJob(t, repo)
+
+	count, totalChanges, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now)
+	if err != nil {
+		t.Fatalf("snapshot plan: %v", err)
 	}
 	if count != 3 {
-		t.Errorf("expected 3 unapplied changes (changes 1,2,4), got %d", count)
+		t.Errorf("expected count=3, got %d", count)
+	}
+	if totalChanges != 10 {
+		t.Errorf("expected totalChanges=10, got %d", totalChanges)
+	}
+
+	// seq assigned by commit_lsn DESC: newest transaction first.
+	txns, err := repo.ListJobTransactions(ctx, job.ID, 0, 10)
+	if err != nil {
+		t.Fatalf("list job transactions: %v", err)
+	}
+	wantOrder := []uint64{3, 2, 1}
+	if len(txns) != len(wantOrder) {
+		t.Fatalf("expected %d snapshot rows, got %d", len(wantOrder), len(txns))
+	}
+	for i, wantTxnID := range wantOrder {
+		if txns[i].Seq != i+1 {
+			t.Errorf("row %d: expected seq=%d, got %d", i, i+1, txns[i].Seq)
+		}
+		if txns[i].TransactionID != wantTxnID {
+			t.Errorf("row %d: expected transaction_id=%d, got %d", i, wantTxnID, txns[i].TransactionID)
+		}
+		if txns[i].Status != domain.RevertTransactionStatusPending {
+			t.Errorf("row %d: expected pending, got %s", i, txns[i].Status)
+		}
+	}
+	if txns[0].CommitLSN != "0/3" {
+		t.Errorf("expected commit_lsn 0/3, got %s", txns[0].CommitLSN)
 	}
 }
 
-func TestFetchUnappliedChanges(t *testing.T) {
+func TestSnapshotPlan_Idempotent(t *testing.T) {
 	ctx := context.Background()
 	pgContainer, db := startPGWithRevertTables(ctx, t)
 	defer func() { pgContainer.Terminate(ctx) }()
@@ -442,170 +387,364 @@ func TestFetchUnappliedChanges(t *testing.T) {
 	repo := postgres.NewRevertRepository(db)
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	insertTestTxn(db, 1, now.Add(-30*time.Minute))
-	insertTestTxn(db, 2, now.Add(-10*time.Minute))
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 2)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 3)
 
-	insertTestChange(db, 1, 1, 1, "users", "U", "UPDATE users SET email='old' WHERE id=1", "not_applied")
-	insertTestChange(db, 2, 2, 1, "orders", "D", "INSERT INTO orders (id) VALUES (1)", "not_applied")
-	insertTestChange(db, 3, 2, 2, "orders", "I", "DELETE FROM orders WHERE id=2", "applied")
+	job := createTestJob(t, repo)
 
+	count1, total1, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now)
+	if err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+
+	// Replay after a lost checkpoint: same job re-plans → no-op, same counts.
+	count2, total2, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now)
+	if err != nil {
+		t.Fatalf("second snapshot: %v", err)
+	}
+	if count1 != count2 || total1 != total2 {
+		t.Errorf("expected identical counts, got (%d,%d) then (%d,%d)", count1, total1, count2, total2)
+	}
+
+	var rowCount int
+	if err := db.Get(&rowCount, `SELECT COUNT(*) FROM revert_job_transaction WHERE job_id = $1`, job.ID); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if rowCount != 2 {
+		t.Errorf("expected 2 snapshot rows (no duplicates), got %d", rowCount)
+	}
+}
+
+func TestSnapshotPlan_ExcludesAppliedByOtherJob(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 2)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 3)
+
+	jobA := createTestJob(t, repo)
+	if _, _, err := repo.SnapshotPlan(ctx, jobA.ID, now.Add(-1*time.Hour), now); err != nil {
+		t.Fatalf("snapshot A: %v", err)
+	}
+	// Job A applied the txn at seq 1 (txn 2, highest LSN).
+	if _, err := db.Exec(
+		`UPDATE revert_job_transaction SET status = 'applied', applied_at = now() WHERE job_id = $1 AND seq = 1`,
+		jobA.ID); err != nil {
+		t.Fatalf("mark applied for A: %v", err)
+	}
+
+	jobB := createTestJob(t, repo)
+	count, totalChanges, err := repo.SnapshotPlan(ctx, jobB.ID, now.Add(-1*time.Hour), now)
+	if err != nil {
+		t.Fatalf("snapshot B: %v", err)
+	}
+	if count != 1 || totalChanges != 2 {
+		t.Errorf("expected B to snapshot only txn 1 (count=1,total=2), got (%d,%d)", count, totalChanges)
+	}
+}
+
+func TestJobTransactionQueries(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 2)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 3)
+	insertTestTxn(t, db, 3, now.Add(-5*time.Minute), 5)
+
+	job := createTestJob(t, repo)
+	if _, _, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	got, err := repo.GetJobTransaction(ctx, job.ID, 2)
+	if err != nil {
+		t.Fatalf("get job transaction: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected job transaction at seq 2")
+	}
+	if got.TransactionID != 2 || got.CommitLSN != "0/2" || got.ChangeCount != 3 {
+		t.Errorf("unexpected row: %+v", got)
+	}
+
+	page, err := repo.ListJobTransactions(ctx, job.ID, 1, 1)
+	if err != nil {
+		t.Fatalf("list page: %v", err)
+	}
+	if len(page) != 1 || page[0].Seq != 2 {
+		t.Errorf("expected [seq 2], got %+v", page)
+	}
+
+	count, err := repo.CountJobTransactions(ctx, job.ID)
+	if err != nil {
+		t.Fatalf("count job transactions: %v", err)
+	}
+	if count != 3 {
+		t.Errorf("expected 3, got %d", count)
+	}
+
+	missing, err := repo.GetJobTransaction(ctx, job.ID, 99)
+	if err != nil {
+		t.Fatalf("get missing: %v", err)
+	}
+	if missing != nil {
+		t.Error("expected nil for missing seq")
+	}
+}
+
+func TestGetTransactionChanges(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-10*time.Minute), 3)
+	insertTestChange(t, db, 1, 1, 1, "users", "U", "UPDATE users SET email='a' WHERE id=1")
+	insertTestChange(t, db, 2, 1, 2, "orders", "D", "INSERT INTO orders (id) VALUES (9)")
+	insertTestChange(t, db, 3, 1, 3, "users", "I", "DELETE FROM users WHERE id=2")
+
+	changes, err := repo.GetTransactionChanges(ctx, 1)
+	if err != nil {
+		t.Fatalf("get transaction changes: %v", err)
+	}
+	if len(changes) != 3 {
+		t.Fatalf("expected 3 changes, got %d", len(changes))
+	}
+	// Revert order: change_seq_in_txn DESC.
+	for i, wantSeq := range []int32{3, 2, 1} {
+		if changes[i].ChangeSeqInTxn != wantSeq {
+			t.Errorf("change %d: expected seq %d, got %d", i, wantSeq, changes[i].ChangeSeqInTxn)
+		}
+	}
+	if changes[0].ReverseDMLSQL != "DELETE FROM users WHERE id=2" {
+		t.Errorf("unexpected reverse SQL: %s", changes[0].ReverseDMLSQL)
+	}
+}
+
+func TestMarkTransactionApplied(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-10*time.Minute), 4)
+
+	job := createTestJob(t, repo)
+	if _, _, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	stx, tx := beginTestTx(ctx, t, db)
+	if err := repo.MarkTransactionApplied(ctx, stx, job.ID, 1); err != nil {
+		tx.Rollback()
+		t.Fatalf("mark applied: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	row, err := repo.GetJobTransaction(ctx, job.ID, 1)
+	if err != nil {
+		t.Fatalf("get job transaction: %v", err)
+	}
+	if row.Status != domain.RevertTransactionStatusApplied {
+		t.Errorf("expected applied, got %s", row.Status)
+	}
+	if row.AppliedAt == nil {
+		t.Error("expected applied_at to be set")
+	}
+
+	updated, _ := repo.GetJob(ctx, job.ID)
+	if updated.CompletedCount != 4 {
+		t.Errorf("expected completed_count=4, got %d", updated.CompletedCount)
+	}
+}
+
+func TestMarkTransactionFailed(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	insertTestTxn(t, db, 1, now.Add(-10*time.Minute), 4)
+
+	job := createTestJob(t, repo)
+	if _, _, err := repo.SnapshotPlan(ctx, job.ID, now.Add(-1*time.Hour), now); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+
+	stx, tx := beginTestTx(ctx, t, db)
+	if err := repo.MarkTransactionFailed(ctx, stx, job.ID, 1, "exec error"); err != nil {
+		tx.Rollback()
+		t.Fatalf("mark failed: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	row, err := repo.GetJobTransaction(ctx, job.ID, 1)
+	if err != nil {
+		t.Fatalf("get job transaction: %v", err)
+	}
+	if row.Status != domain.RevertTransactionStatusFailed {
+		t.Errorf("expected failed, got %s", row.Status)
+	}
+	if row.ErrorMessage != "exec error" {
+		t.Errorf("expected error message, got %q", row.ErrorMessage)
+	}
+
+	updated, _ := repo.GetJob(ctx, job.ID)
+	if updated.FailedCount != 4 {
+		t.Errorf("expected failed_count=4, got %d", updated.FailedCount)
+	}
+}
+
+func TestListPendingJobIDs(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	job1 := createTestJob(t, repo)
+	time.Sleep(10 * time.Millisecond) // distinct created_at for ordering
+	job2 := createTestJob(t, repo)
+	job2.Status = domain.RevertJobStatusInProgress
+	if err := repo.UpdateJob(ctx, job2); err != nil {
+		t.Fatalf("update job2: %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	job3 := createTestJob(t, repo)
+
+	ids, err := repo.ListPendingJobIDs(ctx)
+	if err != nil {
+		t.Fatalf("list pending: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 pending jobs, got %d", len(ids))
+	}
+	if ids[0] != job1.ID || ids[1] != job3.ID {
+		t.Errorf("expected [%s %s] oldest-first, got %v", job1.ID, job3.ID, ids)
+	}
+}
+
+// insertTestChangeWithRows inserts a change with the row payloads a preview
+// needs (old_row/new_row as JSONB).
+func insertTestChangeWithRows(t *testing.T, db *sqlx.DB, id, txnID uint64, seq int32, tableName, op string, oldRow, newRow map[string]any, reverseSQL string) {
+	t.Helper()
+	var oldJSON, newJSON []byte
+	var err error
+	if oldRow != nil {
+		if oldJSON, err = json.Marshal(oldRow); err != nil {
+			t.Fatalf("marshal old row: %v", err)
+		}
+	}
+	if newRow != nil {
+		if newJSON, err = json.Marshal(newRow); err != nil {
+			t.Fatalf("marshal new row: %v", err)
+		}
+	}
+	_, err = db.Exec(
+		`INSERT INTO wal_change (id, transaction_id, change_seq_in_txn, schema_name, table_name, op, changed_columns, old_row, new_row, forward_dml_sql, reverse_dml_sql)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		id, txnID, seq, "public", tableName, op, pq.StringArray{"status"}, oldJSON, newJSON, reverseSQL, reverseSQL,
+	)
+	if err != nil {
+		t.Fatalf("insert change %d: %v", id, err)
+	}
+}
+
+func TestListRevertableChanges_OrderAndPayloads(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevertTables(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	repo := postgres.NewRevertRepository(db)
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
 	from := now.Add(-1 * time.Hour)
 	to := now
 
-	changes, err := repo.FetchUnappliedChanges(ctx, from, to, 0, 10)
+	// txn 1 older (lower LSN), txn 2 newer. Revert order = newest first,
+	// and within a txn change_seq DESC.
+	insertTestTxn(t, db, 1, now.Add(-30*time.Minute), 1)
+	insertTestChangeWithRows(t, db, 10, 1, 1, "orders", "U",
+		map[string]any{"id": "17", "status": "processing"},
+		map[string]any{"id": "17", "status": "paid"},
+		`UPDATE public.orders SET status = 'processing' WHERE id = '17'`)
+	insertTestTxn(t, db, 2, now.Add(-20*time.Minute), 2)
+	insertTestChangeWithRows(t, db, 20, 2, 1, "orders", "I",
+		nil, map[string]any{"id": "42", "status": "pending"},
+		`DELETE FROM public.orders WHERE id = '42'`)
+	insertTestChangeWithRows(t, db, 21, 2, 2, "customers", "D",
+		map[string]any{"id": "7", "name": "Ada"}, nil,
+		`INSERT INTO public.customers (id, name) VALUES ('7', 'Ada') ON CONFLICT DO NOTHING`)
+
+	changes, err := repo.ListRevertableChanges(ctx, from, to)
 	if err != nil {
-		t.Fatalf("fetch: %v", err)
+		t.Fatalf("ListRevertableChanges: %v", err)
 	}
-	if len(changes) != 2 {
-		t.Fatalf("expected 2 changes, got %d", len(changes))
-	}
-
-	if changes[0].ReverseDMLSQL != "INSERT INTO orders (id) VALUES (1)" {
-		t.Errorf("expected most recent first (txn 2, seq 1), got %s", changes[0].ReverseDMLSQL)
-	}
-	if changes[1].ReverseDMLSQL != "UPDATE users SET email='old' WHERE id=1" {
-		t.Errorf("expected older second (txn 1, seq 1), got %s", changes[1].ReverseDMLSQL)
-	}
-}
-
-func TestFetchUnappliedChanges_Pagination(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	insertTestTxn(db, 1, now.Add(-10*time.Minute))
-
-	for i := 0; i < 5; i++ {
-		insertTestChange(db, uint64(i+1), 1, int32(i+1), "users", "U", fmt.Sprintf("SQL %d", i), "not_applied")
+	if len(changes) != 3 {
+		t.Fatalf("changes = %d, want 3", len(changes))
 	}
 
-	from := now.Add(-1 * time.Hour)
-	to := now
-
-	page1, err := repo.FetchUnappliedChanges(ctx, from, to, 0, 3)
-	if err != nil {
-		t.Fatalf("fetch page1: %v", err)
-	}
-	if len(page1) != 3 {
-		t.Fatalf("expected 3 changes on page 1, got %d", len(page1))
+	// commit_lsn DESC, then change_seq_in_txn DESC.
+	wantOrder := []uint64{21, 20, 10}
+	for i, id := range wantOrder {
+		if changes[i].ID != id {
+			t.Fatalf("order[%d] = change %d, want %d", i, changes[i].ID, id)
+		}
 	}
 
-	page2, err := repo.FetchUnappliedChanges(ctx, from, to, 3, 3)
-	if err != nil {
-		t.Fatalf("fetch page2: %v", err)
+	// Row payloads round-trip.
+	if changes[2].OldRow["status"] != "processing" || changes[2].NewRow["status"] != "paid" {
+		t.Errorf("change 10 rows: old=%v new=%v", changes[2].OldRow, changes[2].NewRow)
 	}
-	if len(page2) != 2 {
-		t.Fatalf("expected 2 changes on page 2, got %d", len(page2))
+	if changes[0].NewRow != nil || changes[0].OldRow["name"] != "Ada" {
+		t.Errorf("change 21 rows: old=%v new=%v", changes[0].OldRow, changes[0].NewRow)
 	}
-}
-
-func TestMarkChangeApplied(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	insertTestTxn(db, 1, now.Add(-10*time.Minute))
-	insertTestChange(db, 1, 1, 1, "users", "U", "UPDATE users SET email='old' WHERE id=1", "not_applied")
-
-	from := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
-	to := time.Now().UTC().Truncate(time.Microsecond)
-	job := domain.NewRevertJob(from, to)
-	repo.CreateJob(ctx, job)
-
-	change := domain.WalChangeResult{
-		ID:             1,
-		TransactionID:  1,
-		ChangeSeqInTxn: 1,
-		SchemaName:     "public",
-		TableName:      "users",
-		Op:             "U",
-		ReverseDMLSQL:  "UPDATE users SET email='old' WHERE id=1",
+	if len(changes[2].ChangedColumns) != 1 || changes[2].ChangedColumns[0] != "status" {
+		t.Errorf("changed_columns = %v", changes[2].ChangedColumns)
 	}
 
-	if err := repo.MarkChangeApplied(ctx, job.ID, change); err != nil {
+	// After txn 2 is applied by a job, its changes drop out of the window.
+	job := createTestJob(t, repo)
+	if _, _, err := repo.SnapshotPlan(ctx, job.ID, from, to); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if _, err := db.Exec(
+		`UPDATE revert_job_transaction SET status = 'applied', applied_at = now() WHERE job_id = $1 AND seq = 1`,
+		job.ID); err != nil {
 		t.Fatalf("mark applied: %v", err)
 	}
 
-	var undoStatus string
-	db.Get(&undoStatus, "SELECT undo_status FROM wal_change WHERE id = $1", change.ID)
-	if undoStatus != "applied" {
-		t.Errorf("expected undo_status=applied, got %s", undoStatus)
-	}
-
-	var changeStatus string
-	db.Get(&changeStatus, "SELECT status FROM revert_job_change WHERE job_id = $1 AND change_id = $2", job.ID, change.ID)
-	if changeStatus != "applied" {
-		t.Errorf("expected revert_job_change status=applied, got %s", changeStatus)
-	}
-}
-
-func TestMarkChangeFailed(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	now := time.Now().UTC().Truncate(time.Microsecond)
-	insertTestTxn(db, 1, now.Add(-10*time.Minute))
-	insertTestChange(db, 1, 1, 1, "users", "U", "UPDATE users SET email='old' WHERE id=1", "not_applied")
-
-	from := time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond)
-	to := time.Now().UTC().Truncate(time.Microsecond)
-	job := domain.NewRevertJob(from, to)
-	repo.CreateJob(ctx, job)
-
-	change := domain.WalChangeResult{
-		ID:             1,
-		TransactionID:  1,
-		ChangeSeqInTxn: 1,
-		ReverseDMLSQL:  "UPDATE users SET email='old' WHERE id=1",
-	}
-
-	if err := repo.MarkChangeFailed(ctx, job.ID, change, "exec error"); err != nil {
-		t.Fatalf("mark failed: %v", err)
-	}
-
-	var changeStatus string
-	var errMsg string
-	db.Get(&errMsg, "SELECT error_message FROM revert_job_change WHERE job_id = $1 AND change_id = $2", job.ID, change.ID)
-	if errMsg != "exec error" {
-		t.Errorf("expected error_message='exec error', got %s", errMsg)
-	}
-
-	db.Get(&changeStatus, "SELECT status FROM revert_job_change WHERE job_id = $1 AND change_id = $2", job.ID, change.ID)
-	if changeStatus != "failed" {
-		t.Errorf("expected status=failed, got %s", changeStatus)
-	}
-}
-
-func TestAdvisoryLock(t *testing.T) {
-	ctx := context.Background()
-	pgContainer, db := startPGWithRevertTables(ctx, t)
-	defer func() { pgContainer.Terminate(ctx) }()
-	defer db.Close()
-
-	repo := postgres.NewRevertRepository(db)
-
-	locked, err := repo.TryAcquireAdvisoryLock(ctx)
+	changes, err = repo.ListRevertableChanges(ctx, from, to)
 	if err != nil {
-		t.Fatalf("try lock: %v", err)
+		t.Fatalf("ListRevertableChanges after apply: %v", err)
 	}
-	if !locked {
-		t.Fatal("expected lock to be acquired")
-	}
-
-	if err := repo.ReleaseAdvisoryLock(ctx); err != nil {
-		t.Fatalf("release lock: %v", err)
+	if len(changes) != 1 || changes[0].ID != 10 {
+		t.Errorf("after apply: changes = %+v, want only change 10", changes)
 	}
 }
 

@@ -112,24 +112,40 @@ func TestRevertJob_IsTerminal(t *testing.T) {
 	}
 }
 
-func TestRevertJobChange_Defaults(t *testing.T) {
-	jobID := uuid.New()
-	changeID := uint64(42)
-	change := domain.NewRevertJobChange(jobID, changeID)
+func TestRevertJobTransaction_ToResponse(t *testing.T) {
+	now := time.Now()
+	txn := &domain.RevertJobTransaction{
+		JobID:         uuid.New(),
+		Seq:           3,
+		TransactionID: 42,
+		CommitLSN:     "0/1A2B3C0",
+		ChangeCount:   7,
+		Status:        domain.RevertTransactionStatusApplied,
+		ErrorMessage:  "boom",
+		AppliedAt:     &now,
+	}
 
-	if change.JobID != jobID {
-		t.Errorf("expected JobID=%s, got %s", jobID, change.JobID)
+	resp := txn.ToResponse()
+
+	if resp.Seq != 3 {
+		t.Errorf("expected Seq=3, got %d", resp.Seq)
 	}
-	if change.ChangeID != changeID {
-		t.Errorf("expected ChangeID=%d, got %d", changeID, change.ChangeID)
+	if resp.TransactionID != 42 {
+		t.Errorf("expected TransactionID=42, got %d", resp.TransactionID)
 	}
-	if change.Status != domain.RevertChangeStatusPending {
-		t.Errorf("expected status pending, got %s", change.Status)
+	if resp.CommitLSN != "0/1A2B3C0" {
+		t.Errorf("expected CommitLSN=0/1A2B3C0, got %s", resp.CommitLSN)
 	}
-	if change.ErrorMessage != "" {
-		t.Errorf("expected empty ErrorMessage, got %s", change.ErrorMessage)
+	if resp.ChangeCount != 7 {
+		t.Errorf("expected ChangeCount=7, got %d", resp.ChangeCount)
 	}
-	if change.AppliedAt != nil {
-		t.Error("expected nil AppliedAt")
+	if resp.Status != "applied" {
+		t.Errorf("expected status applied, got %s", resp.Status)
+	}
+	if resp.ErrorMessage != "boom" {
+		t.Errorf("expected ErrorMessage=boom, got %s", resp.ErrorMessage)
+	}
+	if resp.AppliedAt == nil || !resp.AppliedAt.Equal(now) {
+		t.Errorf("expected AppliedAt=%v, got %v", now, resp.AppliedAt)
 	}
 }

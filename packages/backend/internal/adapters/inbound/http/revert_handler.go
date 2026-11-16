@@ -19,10 +19,39 @@ func NewRevertHandler(svc inbound.RevertService) *RevertHandler {
 }
 
 func (h *RevertHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("POST /reverts/preview", h.previewRevert)
 	mux.HandleFunc("POST /reverts/jobs", h.createRevertJob)
 	mux.HandleFunc("GET /reverts/jobs/{id}", h.getRevertJob)
 	mux.HandleFunc("GET /reverts/jobs", h.listRevertJobs)
+	mux.HandleFunc("GET /reverts/jobs/{id}/transactions", h.listJobTransactions)
 	mux.HandleFunc("DELETE /reverts/jobs/{id}", h.cancelRevertJob)
+}
+
+// previewRevert dry-runs a revert window on the source database (rolled
+// back, nothing applied) and returns each affected row's current and
+// post-revert state.
+func (h *RevertHandler) previewRevert(w http.ResponseWriter, r *http.Request) {
+	var req domain.PreviewRevertRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.From.IsZero() || req.To.IsZero() {
+		writeError(w, http.StatusBadRequest, "from and to are required")
+		return
+	}
+	if !req.From.Before(req.To) {
+		writeError(w, http.StatusBadRequest, "from must be before to")
+		return
+	}
+
+	preview, err := h.svc.PreviewRevert(r.Context(), req.From, req.To)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, preview)
 }
 
 func (h *RevertHandler) createRevertJob(w http.ResponseWriter, r *http.Request) {
@@ -81,6 +110,40 @@ func (h *RevertHandler) listRevertJobs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, domain.PaginatedResponse[domain.RevertJobResponse]{
+		Data:       responses,
+		Page:       result.Page,
+		PageSize:   result.PageSize,
+		TotalCount: result.TotalCount,
+		TotalPages: result.TotalPages,
+	})
+}
+
+func (h *RevertHandler) listJobTransactions(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid job id")
+		return
+	}
+
+	page := queryParamInt(r, "page", 1)
+	pageSize := queryParamInt(r, "page_size", 20)
+
+	result, err := h.svc.ListJobTransactions(r.Context(), id, page, pageSize)
+	if err != nil {
+		if err.Error() == "revert job not found" {
+			writeError(w, http.StatusNotFound, err.Error())
+		} else {
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	responses := make([]domain.RevertJobTransactionResponse, len(result.Data))
+	for i, t := range result.Data {
+		responses[i] = t.ToResponse()
+	}
+
+	writeJSON(w, http.StatusOK, domain.PaginatedResponse[domain.RevertJobTransactionResponse]{
 		Data:       responses,
 		Page:       result.Page,
 		PageSize:   result.PageSize,

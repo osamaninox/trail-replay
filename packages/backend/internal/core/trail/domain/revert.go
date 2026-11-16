@@ -53,28 +53,49 @@ func (j *RevertJob) IsTerminal() bool {
 		j.Status == RevertJobStatusCancelled
 }
 
-type RevertChangeStatus string
+type RevertTransactionStatus string
 
 const (
-	RevertChangeStatusPending RevertChangeStatus = "pending"
-	RevertChangeStatusApplied RevertChangeStatus = "applied"
-	RevertChangeStatusFailed  RevertChangeStatus = "failed"
-	RevertChangeStatusSkipped RevertChangeStatus = "skipped"
+	RevertTransactionStatusPending    RevertTransactionStatus = "pending"
+	RevertTransactionStatusInProgress RevertTransactionStatus = "in_progress"
+	RevertTransactionStatusApplied    RevertTransactionStatus = "applied"
+	RevertTransactionStatusFailed     RevertTransactionStatus = "failed"
+	RevertTransactionStatusSkipped    RevertTransactionStatus = "skipped"
 )
 
-type RevertJobChange struct {
-	JobID        uuid.UUID
-	ChangeID     uint64
-	Status       RevertChangeStatus
-	ErrorMessage string
-	AppliedAt    *time.Time
+// RevertJobTransaction is one unit of work in a revert job's plan snapshot.
+// seq is the transaction's position in the revert order (commit_lsn DESC) and
+// maps 1:1 to the DBOS workflow step index that reverts it.
+type RevertJobTransaction struct {
+	JobID         uuid.UUID
+	Seq           int
+	TransactionID uint64
+	CommitLSN     string
+	ChangeCount   int
+	Status        RevertTransactionStatus
+	ErrorMessage  string
+	AppliedAt     *time.Time
 }
 
-func NewRevertJobChange(jobID uuid.UUID, changeID uint64) *RevertJobChange {
-	return &RevertJobChange{
-		JobID:    jobID,
-		ChangeID: changeID,
-		Status:   RevertChangeStatusPending,
+type RevertJobTransactionResponse struct {
+	Seq           int        `json:"seq"`
+	TransactionID uint64     `json:"transaction_id"`
+	CommitLSN     string     `json:"commit_lsn"`
+	ChangeCount   int        `json:"change_count"`
+	Status        string     `json:"status"`
+	ErrorMessage  string     `json:"error_message,omitempty"`
+	AppliedAt     *time.Time `json:"applied_at,omitempty"`
+}
+
+func (t *RevertJobTransaction) ToResponse() RevertJobTransactionResponse {
+	return RevertJobTransactionResponse{
+		Seq:           t.Seq,
+		TransactionID: t.TransactionID,
+		CommitLSN:     t.CommitLSN,
+		ChangeCount:   t.ChangeCount,
+		Status:        string(t.Status),
+		ErrorMessage:  t.ErrorMessage,
+		AppliedAt:     t.AppliedAt,
 	}
 }
 

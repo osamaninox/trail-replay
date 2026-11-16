@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
+	"github.com/pressly/goose/v3"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -69,52 +70,25 @@ func startPGWithRevert(ctx context.Context, t *testing.T) (*tcpostgres.PostgresC
 	return pgContainer, db
 }
 
+// runRevertHandlerMigrations applies the real goose migrations so tests
+// always run against the shipped schema (go test runs with cwd = package dir).
 func runRevertHandlerMigrations(db *sqlx.DB) error {
-	statements := []string{
-		`CREATE TABLE revert_job (
-			id              uuid primary key,
-			status          text not null default 'pending',
-			input_from      timestamptz not null,
-			input_to        timestamptz not null,
-			total_changes   int not null default 0,
-			completed_count int not null default 0,
-			failed_count    int not null default 0,
-			last_error      text,
-			created_at      timestamptz not null default now(),
-			updated_at      timestamptz not null default now(),
-			completed_at    timestamptz
-		)`,
-		`CREATE TABLE wal_transaction (
-			id bigserial primary key, source_slot text, source_db text, xid bigint,
-			commit_lsn pg_lsn, commit_ts timestamptz, change_count int, ingested_at timestamptz
-		)`,
-		`CREATE TABLE wal_change (
-			id bigserial primary key, transaction_id bigint references wal_transaction(id),
-			change_seq_in_txn int, schema_name text, table_name text, op char(1),
-			forward_dml_sql text not null default '', reverse_dml_sql text not null default '',
-			undo_status text not null default 'not_applied',
-			changed_columns text[] not null default '{}', created_at timestamptz not null default now()
-		)`,
-		`CREATE TABLE revert_job_change (
-			job_id uuid references revert_job(id) on delete cascade,
-			change_id bigint references wal_change(id),
-			status text not null default 'pending',
-			error_message text,
-			applied_at timestamptz,
-			primary key (job_id, change_id)
-		)`,
+	if err := goose.SetDialect("postgres"); err != nil {
+		return err
 	}
-	for _, s := range statements {
-		if _, err := db.Exec(s); err != nil {
-			return fmt.Errorf("migration error: %w\nSQL: %s", err, s)
-		}
-	}
-	return nil
+	return goose.Up(db.DB, "../../../../migrations")
 }
+
+// noopSubmitter satisfies the service's RevertJobSubmitter port; handler
+// tests exercise HTTP ↔ service ↔ repo and don't involve the workflow engine.
+type noopSubmitter struct{}
+
+func (noopSubmitter) Submit(context.Context, uuid.UUID) error { return nil }
+func (noopSubmitter) Cancel(context.Context, uuid.UUID) error { return nil }
 
 func setupRevertHandler(db *sqlx.DB) *httphandler.RevertHandler {
 	repo := postgres.NewRevertRepository(db)
-	svc := services.NewRevertService(repo, nil)
+	svc := services.NewRevertService(repo, noopSubmitter{}, nil)
 	return httphandler.NewRevertHandler(svc)
 }
 
@@ -366,5 +340,85 @@ func TestCancelRevertJob_Completed(t *testing.T) {
 
 	if cancelRec.Code != http.StatusConflict {
 		t.Errorf("expected 409, got %d", cancelRec.Code)
+	}
+}
+
+func TestListJobTransactions_Success(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevert(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	h := setupRevertHandler(db)
+
+	from := time.Now().Add(-1 * time.Hour).UTC()
+	to := time.Now().UTC()
+	body := fmt.Sprintf(`{"from":"%s","to":"%s"}`, from.Format(time.RFC3339Nano), to.Format(time.RFC3339Nano))
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+
+	createReq := httptest.NewRequest(http.MethodPost, "/reverts/jobs", strings.NewReader(body))
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+
+	var created domain.RevertJobResponse
+	json.NewDecoder(createRec.Body).Decode(&created)
+
+	// Seed the plan snapshot directly (the workflow would do this at runtime).
+	for seq, txnID := range []int64{20, 10} {
+		_, err := db.Exec(
+			`INSERT INTO revert_job_transaction (job_id, seq, transaction_id, commit_lsn, change_count, status)
+			 VALUES ($1, $2, $3, $4, $5, 'pending')`,
+			created.ID, seq+1, txnID, fmt.Sprintf("0/%X", txnID), 3)
+		if err != nil {
+			t.Fatalf("seed snapshot row: %v", err)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/reverts/jobs/%s/transactions", created.ID), nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var got domain.PaginatedResponse[domain.RevertJobTransactionResponse]
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.TotalCount != 2 || len(got.Data) != 2 {
+		t.Fatalf("expected 2 transactions, got total=%d len=%d", got.TotalCount, len(got.Data))
+	}
+	if got.Data[0].Seq != 1 || got.Data[0].TransactionID != 20 || got.Data[0].ChangeCount != 3 {
+		t.Errorf("unexpected first row: %+v", got.Data[0])
+	}
+	if got.Data[0].Status != "pending" {
+		t.Errorf("expected status pending, got %s", got.Data[0].Status)
+	}
+	if got.Data[1].Seq != 2 || got.Data[1].TransactionID != 10 {
+		t.Errorf("unexpected second row: %+v", got.Data[1])
+	}
+}
+
+func TestListJobTransactions_NotFound(t *testing.T) {
+	ctx := context.Background()
+	pgContainer, db := startPGWithRevert(ctx, t)
+	defer func() { pgContainer.Terminate(ctx) }()
+	defer db.Close()
+
+	h := setupRevertHandler(db)
+
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/reverts/jobs/%s/transactions", uuid.New()), nil)
+	rec := httptest.NewRecorder()
+
+	mux := http.NewServeMux()
+	h.RegisterRoutes(mux)
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404, got %d", rec.Code)
 	}
 }

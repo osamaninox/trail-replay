@@ -13,8 +13,6 @@ import (
 	"trail-replay/internal/core/trail/ports/outbound"
 )
 
-const revertAdvisoryLockID = 123456789
-
 type revertRepository struct {
 	db *sqlx.DB
 }
@@ -112,46 +110,180 @@ func (r *revertRepository) UpdateJob(ctx context.Context, job *domain.RevertJob)
 	return err
 }
 
-func (r *revertRepository) GetNextPendingJob(ctx context.Context) (*domain.RevertJob, error) {
-	var row revertJobRow
-	err := r.db.GetContext(ctx, &row,
-		`SELECT id, status, input_from, input_to, total_changes, completed_count, failed_count, last_error, created_at, updated_at, completed_at
-		 FROM revert_job WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1`)
-	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return rowToJob(&row), nil
-}
-
-func (r *revertRepository) GetActiveJob(ctx context.Context) (*domain.RevertJob, error) {
-	var row revertJobRow
-	err := r.db.GetContext(ctx, &row,
-		`SELECT id, status, input_from, input_to, total_changes, completed_count, failed_count, last_error, created_at, updated_at, completed_at
-		 FROM revert_job WHERE status = 'in_progress' LIMIT 1`)
-	if err != nil {
-		if err.Error() == "sql: no rows in result set" {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return rowToJob(&row), nil
-}
-
-func (r *revertRepository) CountUnappliedChanges(ctx context.Context, from, to time.Time) (int, error) {
+// CountRevertableTransactions estimates job size at creation time. Eligibility
+// is an anti-join against revert_job_transaction (wal_change.undo_* columns are
+// legacy/unused), not undo_status='not_applied'.
+func (r *revertRepository) CountRevertableTransactions(ctx context.Context, from, to time.Time) (int, error) {
 	var count int
 	err := r.db.GetContext(ctx, &count,
-		`SELECT COUNT(*) FROM wal_change wc
-		 JOIN wal_transaction wt ON wc.transaction_id = wt.id
-		 WHERE wc.undo_status = 'not_applied' AND wt.commit_ts >= $1 AND wt.commit_ts <= $2`,
+		`SELECT COUNT(*) FROM wal_transaction wt
+		 WHERE wt.commit_ts >= $1 AND wt.commit_ts <= $2
+		   AND NOT EXISTS (
+		       SELECT 1 FROM revert_job_transaction rjt
+		       WHERE rjt.transaction_id = wt.id AND rjt.status = 'applied'
+		   )`,
 		from, to,
 	)
 	return count, err
 }
 
-func (r *revertRepository) FetchUnappliedChanges(ctx context.Context, from, to time.Time, offset, limit int) ([]domain.WalChangeResult, error) {
+// ListRevertableChanges returns the window's changes in revert execution
+// order with the row payloads a preview needs. Same eligibility anti-join as
+// SnapshotPlan: changes whose transaction was already applied by a job are
+// excluded.
+func (r *revertRepository) ListRevertableChanges(ctx context.Context, from, to time.Time) ([]domain.RevertChange, error) {
+	var rows []struct {
+		ID             uint64         `db:"id"`
+		TransactionID  uint64         `db:"transaction_id"`
+		ChangeSeqInTxn int32          `db:"change_seq_in_txn"`
+		SchemaName     string         `db:"schema_name"`
+		TableName      string         `db:"table_name"`
+		Op             string         `db:"op"`
+		ChangedColumns pq.StringArray `db:"changed_columns"`
+		OldRow         *PayloadJSON   `db:"old_row"`
+		NewRow         *PayloadJSON   `db:"new_row"`
+		ReverseDMLSQL  string         `db:"reverse_dml_sql"`
+	}
+	err := r.db.SelectContext(ctx, &rows,
+		`SELECT c.id, c.transaction_id, c.change_seq_in_txn, c.schema_name, c.table_name, c.op,
+		        c.changed_columns, c.old_row, c.new_row, c.reverse_dml_sql
+		 FROM wal_change c
+		 JOIN wal_transaction wt ON wt.id = c.transaction_id
+		 WHERE wt.commit_ts >= $1 AND wt.commit_ts <= $2
+		   AND NOT EXISTS (
+		       SELECT 1 FROM revert_job_transaction rjt
+		       WHERE rjt.transaction_id = wt.id AND rjt.status = 'applied'
+		   )
+		 ORDER BY wt.commit_lsn DESC, c.change_seq_in_txn DESC`,
+		from, to,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list revertable changes: %w", err)
+	}
+	result := make([]domain.RevertChange, len(rows))
+	for i, row := range rows {
+		result[i] = domain.RevertChange{
+			ID:             row.ID,
+			TransactionID:  row.TransactionID,
+			ChangeSeqInTxn: row.ChangeSeqInTxn,
+			SchemaName:     row.SchemaName,
+			TableName:      row.TableName,
+			Op:             row.Op,
+			ChangedColumns: []string(row.ChangedColumns),
+			OldRow:         payloadToMap(row.OldRow),
+			NewRow:         payloadToMap(row.NewRow),
+			ReverseDMLSQL:  row.ReverseDMLSQL,
+		}
+	}
+	return result, nil
+}
+
+func payloadToMap(p *PayloadJSON) map[string]any {
+	if p == nil || *p == nil {
+		return nil
+	}
+	return map[string]any(*p)
+}
+
+// SnapshotPlan freezes the work list once: seq is assigned by row_number() over
+// commit_lsn DESC so "step i" always means the same transaction across
+// crash/replay. ON CONFLICT DO NOTHING makes replay after a lost checkpoint a
+// no-op; the count/sum then read from the snapshot itself.
+func (r *revertRepository) SnapshotPlan(ctx context.Context, jobID uuid.UUID, from, to time.Time) (count, totalChanges int, err error) {
+	_, err = r.db.ExecContext(ctx,
+		`INSERT INTO revert_job_transaction (job_id, seq, transaction_id, commit_lsn, change_count)
+		 SELECT $1, row_number() OVER (ORDER BY wt.commit_lsn DESC), wt.id, wt.commit_lsn, wt.change_count
+		 FROM wal_transaction wt
+		 WHERE wt.commit_ts >= $2 AND wt.commit_ts <= $3
+		   AND NOT EXISTS (
+		       SELECT 1 FROM revert_job_transaction rjt
+		       WHERE rjt.transaction_id = wt.id AND rjt.status = 'applied'
+		   )
+		 ON CONFLICT DO NOTHING`,
+		jobID, from, to,
+	)
+	if err != nil {
+		return 0, 0, fmt.Errorf("snapshot plan: %w", err)
+	}
+
+	err = r.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(change_count), 0)
+		 FROM revert_job_transaction WHERE job_id = $1`,
+		jobID,
+	).Scan(&count, &totalChanges)
+	if err != nil {
+		return 0, 0, fmt.Errorf("count snapshot: %w", err)
+	}
+	return count, totalChanges, nil
+}
+
+type revertJobTransactionRow struct {
+	JobID         uuid.UUID  `db:"job_id"`
+	Seq           int        `db:"seq"`
+	TransactionID uint64     `db:"transaction_id"`
+	CommitLSN     string     `db:"commit_lsn"`
+	ChangeCount   int        `db:"change_count"`
+	Status        string     `db:"status"`
+	ErrorMessage  *string    `db:"error_message"`
+	AppliedAt     *time.Time `db:"applied_at"`
+}
+
+func rowToJobTransaction(row *revertJobTransactionRow) *domain.RevertJobTransaction {
+	t := &domain.RevertJobTransaction{
+		JobID:         row.JobID,
+		Seq:           row.Seq,
+		TransactionID: row.TransactionID,
+		CommitLSN:     row.CommitLSN,
+		ChangeCount:   row.ChangeCount,
+		Status:        domain.RevertTransactionStatus(row.Status),
+		AppliedAt:     row.AppliedAt,
+	}
+	if row.ErrorMessage != nil {
+		t.ErrorMessage = *row.ErrorMessage
+	}
+	return t
+}
+
+const jobTransactionColumns = `job_id, seq, transaction_id, commit_lsn::text AS commit_lsn, change_count, status, error_message, applied_at`
+
+func (r *revertRepository) GetJobTransaction(ctx context.Context, jobID uuid.UUID, seq int) (*domain.RevertJobTransaction, error) {
+	var row revertJobTransactionRow
+	err := r.db.GetContext(ctx, &row,
+		`SELECT `+jobTransactionColumns+` FROM revert_job_transaction WHERE job_id = $1 AND seq = $2`, jobID, seq)
+	if err != nil {
+		if err.Error() == "sql: no rows in result set" {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return rowToJobTransaction(&row), nil
+}
+
+func (r *revertRepository) ListJobTransactions(ctx context.Context, jobID uuid.UUID, offset, limit int) ([]domain.RevertJobTransaction, error) {
+	var rows []revertJobTransactionRow
+	err := r.db.SelectContext(ctx, &rows,
+		`SELECT `+jobTransactionColumns+` FROM revert_job_transaction WHERE job_id = $1 ORDER BY seq LIMIT $2 OFFSET $3`,
+		jobID, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]domain.RevertJobTransaction, len(rows))
+	for i, row := range rows {
+		result[i] = *rowToJobTransaction(&row)
+	}
+	return result, nil
+}
+
+func (r *revertRepository) CountJobTransactions(ctx context.Context, jobID uuid.UUID) (int, error) {
+	var count int
+	err := r.db.GetContext(ctx, &count,
+		`SELECT COUNT(*) FROM revert_job_transaction WHERE job_id = $1`, jobID)
+	return count, err
+}
+
+// GetTransactionChanges returns one transaction's changes in revert order
+// (change_seq_in_txn DESC), scoped to a single txn from the frozen snapshot.
+func (r *revertRepository) GetTransactionChanges(ctx context.Context, transactionID uint64) ([]domain.WalChangeResult, error) {
 	var rows []struct {
 		ID             uint64         `db:"id"`
 		TransactionID  uint64         `db:"transaction_id"`
@@ -166,17 +298,14 @@ func (r *revertRepository) FetchUnappliedChanges(ctx context.Context, from, to t
 		CreatedAt      time.Time      `db:"created_at"`
 	}
 	err := r.db.SelectContext(ctx, &rows,
-		`SELECT wc.id, wc.transaction_id, wc.change_seq_in_txn, wc.schema_name, wc.table_name, wc.op,
-		        wc.changed_columns, wc.forward_dml_sql, wc.reverse_dml_sql, wc.undo_status, wc.created_at
-		 FROM wal_change wc
-		 JOIN wal_transaction wt ON wc.transaction_id = wt.id
-		 WHERE wc.undo_status = 'not_applied' AND wt.commit_ts >= $1 AND wt.commit_ts <= $2
-		 ORDER BY wt.commit_lsn DESC, wc.change_seq_in_txn DESC
-		 LIMIT $3 OFFSET $4`,
-		from, to, limit, offset,
+		`SELECT id, transaction_id, change_seq_in_txn, schema_name, table_name, op,
+		        changed_columns, forward_dml_sql, reverse_dml_sql, undo_status, created_at
+		 FROM wal_change WHERE transaction_id = $1
+		 ORDER BY change_seq_in_txn DESC`,
+		transactionID,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("fetch unapplied changes: %w", err)
+		return nil, fmt.Errorf("fetch transaction changes: %w", err)
 	}
 	result := make([]domain.WalChangeResult, len(rows))
 	for i, row := range rows {
@@ -197,51 +326,51 @@ func (r *revertRepository) FetchUnappliedChanges(ctx context.Context, from, to t
 	return result, nil
 }
 
-func (r *revertRepository) MarkChangeApplied(ctx context.Context, jobID uuid.UUID, change domain.WalChangeResult) error {
-	tx, err := r.db.BeginTxx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	_, err = tx.ExecContext(ctx,
-		`UPDATE wal_change SET undo_status = 'applied', undo_applied_at = now(), undo_applied_by = $1 WHERE id = $2`,
-		jobID.String(), change.ID,
+// MarkTransactionApplied/Failed run on the caller's SQLTx (a DBOS durable
+// transaction): snapshot-row update + job counter increment by that row's
+// change_count, as one CTE statement — no read-then-mark gap. The surrounding
+// transaction also carries DBOS's step record, so the mark commits atomically
+// with it (structural exactly-once, plan §7 decision B).
+func (r *revertRepository) MarkTransactionApplied(ctx context.Context, tx outbound.SQLTx, jobID uuid.UUID, seq int) error {
+	return tx.Exec(ctx,
+		`WITH upd AS (
+		     UPDATE revert_job_transaction
+		     SET status = 'applied', applied_at = now(), error_message = NULL
+		     WHERE job_id = $1 AND seq = $2
+		     RETURNING change_count
+		 )
+		 UPDATE revert_job
+		 SET completed_count = completed_count + (SELECT change_count FROM upd), updated_at = now()
+		 WHERE id = $1`,
+		jobID, seq,
 	)
-	if err != nil {
-		return fmt.Errorf("update wal_change: %w", err)
-	}
-
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO revert_job_change (job_id, change_id, status, applied_at)
-		 VALUES ($1, $2, 'applied', now())`,
-		jobID, change.ID,
-	)
-	if err != nil {
-		return fmt.Errorf("insert revert_job_change: %w", err)
-	}
-
-	return tx.Commit()
 }
 
-func (r *revertRepository) MarkChangeFailed(ctx context.Context, jobID uuid.UUID, change domain.WalChangeResult, errMsg string) error {
-	_, err := r.db.ExecContext(ctx,
-		`INSERT INTO revert_job_change (job_id, change_id, status, error_message)
-		 VALUES ($1, $2, 'failed', $3)`,
-		jobID, change.ID, errMsg,
+func (r *revertRepository) MarkTransactionFailed(ctx context.Context, tx outbound.SQLTx, jobID uuid.UUID, seq int, errMsg string) error {
+	return tx.Exec(ctx,
+		`WITH upd AS (
+		     UPDATE revert_job_transaction
+		     SET status = 'failed', error_message = $3
+		     WHERE job_id = $1 AND seq = $2
+		     RETURNING change_count
+		 )
+		 UPDATE revert_job
+		 SET failed_count = failed_count + (SELECT change_count FROM upd), updated_at = now()
+		 WHERE id = $1`,
+		jobID, seq, errMsg,
 	)
-	return err
 }
 
-func (r *revertRepository) TryAcquireAdvisoryLock(ctx context.Context) (bool, error) {
-	var locked bool
-	err := r.db.GetContext(ctx, &locked, "SELECT pg_try_advisory_lock($1)", revertAdvisoryLockID)
-	return locked, err
-}
-
-func (r *revertRepository) ReleaseAdvisoryLock(ctx context.Context) error {
-	_, err := r.db.ExecContext(ctx, "SELECT pg_advisory_unlock($1)", revertAdvisoryLockID)
-	return err
+// ListPendingJobIDs feeds startup reconciliation: jobs whose insert committed
+// but whose DBOS enqueue was lost get resubmitted on boot.
+func (r *revertRepository) ListPendingJobIDs(ctx context.Context) ([]uuid.UUID, error) {
+	var ids []uuid.UUID
+	err := r.db.SelectContext(ctx, &ids,
+		`SELECT id FROM revert_job WHERE status = 'pending' ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	return ids, nil
 }
 
 func nullableString(s string) *string {
